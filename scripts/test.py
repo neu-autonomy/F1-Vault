@@ -1,88 +1,137 @@
 """
-Simple Test Vehicle
-Creates a basic car from primitives to test if physics works at all
-If this moves, the problem is definitely in your USD file
+F1Tenth from URDF - Updated for Isaac Sim 2025+
+Uses the new isaacsim.asset.importer.urdf module path
 """
 
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": False})
 
 import numpy as np
-from omni.isaac.core import World
-from omni.isaac.core.objects import DynamicCuboid, DynamicSphere
-from pxr import UsdPhysics, PhysxSchema, Gf
+import omni.kit.commands
+from isaacsim.core.api import World
+from isaacsim.core.prims import SingleArticulation
+from isaacsim.asset.importer.urdf import _urdf
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+URDF_PATH = "/home/nail/Desktop/F1-Vault/urdf/f1-tenth_corrected.urdf"
 
 def main():
     print("\n" + "="*70)
-    print("SIMPLE TEST VEHICLE - PHYSICS VERIFICATION")
+    print("F1TENTH - URDF IMPORT (Updated API)")
     print("="*70 + "\n")
     
-    print("Creating a simple box + sphere wheels from scratch...")
-    print("If THIS moves, your F1Tenth USD file is the problem\n")
-    
     # Create world
+    print("Step 1: Creating world...")
     my_world = World(stage_units_in_meters=1.0)
     my_world.scene.add_default_ground_plane()
+    print("✓ World created\n")
     
-    # Create chassis (box)
-    print("Creating chassis...")
-    chassis = my_world.scene.add(
-        DynamicCuboid(
-            prim_path="/World/TestCar/chassis",
-            name="chassis",
-            position=np.array([0, 0, 0.3]),
-            scale=np.array([0.5, 0.3, 0.15]),
-            color=np.array([0.8, 0.2, 0.2]),
-            mass=10.0
+    # Configure URDF import settings
+    print("Step 2: Configuring URDF import...")
+    
+    import_config = _urdf.ImportConfig()
+    import_config.merge_fixed_joints = False              # Keep all joints
+    import_config.convex_decomp = False                   # Use original meshes
+    import_config.fix_base = False                        # CRITICAL - robot must move!
+    import_config.make_default_prim = True
+    import_config.self_collision = False
+    import_config.create_physics_scene = True
+    import_config.import_inertia_tensor = True            # Use URDF masses
+    import_config.default_drive_strength = 10000.0        # Strong drives
+    import_config.default_position_drive_damping = 1000.0
+    import_config.default_drive_type = _urdf.UrdfJointTargetType.JOINT_DRIVE_VELOCITY
+    import_config.distance_scale = 1.0
+    import_config.density = 0.0  # Use URDF mass values
+    
+    print("  Import settings:")
+    print(f"    fix_base: {import_config.fix_base} (False = movable ✓)")
+    print(f"    drive_type: VELOCITY")
+    print(f"    import_inertia: {import_config.import_inertia_tensor}")
+    print()
+    
+    # Import URDF using official method
+    print("Step 3: Importing URDF with omni.kit.commands...")
+    print(f"  Path: {URDF_PATH}")
+    
+    try:
+        result, prim_path = omni.kit.commands.execute(
+            "URDFParseAndImportFile",
+            urdf_path=URDF_PATH,
+            import_config=import_config,
         )
-    )
+        
+        if result:
+            print(f"✓ URDF imported successfully!")
+            print(f"  Robot prim path: {prim_path}\n")
+        else:
+            print("❌ URDF import failed!")
+            simulation_app.close()
+            return
+            
+    except Exception as e:
+        print(f"❌ Error importing URDF: {e}")
+        print("\nCheck:")
+        print("  1. URDF file exists at path")
+        print("  2. Mesh files in meshes/ folder")
+        simulation_app.close()
+        return
     
-    # Create 4 wheels (spheres for simplicity)
-    print("Creating wheels with friction...")
-    wheel_positions = [
-        ("wheel_fl", [ 0.3,  0.25, 0.15]),  # Front left
-        ("wheel_fr", [ 0.3, -0.25, 0.15]),  # Front right
-        ("wheel_rl", [-0.3,  0.25, 0.15]),  # Rear left
-        ("wheel_rr", [-0.3, -0.25, 0.15]),  # Rear right
+    # Create articulation - try to find the robot
+    print("Step 4: Creating articulation...")
+    
+    # The prim_path from import might be just the robot name
+    # Try common variations
+    possible_paths = [
+        prim_path,
+        f"{prim_path}/car_1_base_link",
+        "/car_1_base_link",
+        "/World/car_1_base_link",
     ]
     
-    wheels = []
-    for name, pos in wheel_positions:
-        wheel = my_world.scene.add(
-            DynamicSphere(
-                prim_path=f"/World/TestCar/{name}",
-                name=name,
-                position=np.array(pos),
-                radius=0.1,
-                color=np.array([0.1, 0.1, 0.1]),
-                mass=0.5
+    f1tenth = None
+    actual_path = None
+    
+    for path in possible_paths:
+        try:
+            print(f"  Trying: {path}")
+            f1tenth = my_world.scene.add(
+                SingleArticulation(
+                    prim_path=path,
+                    name="f1tenth"
+                )
             )
-        )
-        
-        # Add HIGH friction to wheels
-        stage = my_world.stage
-        wheel_prim = stage.GetPrimAtPath(f"/World/TestCar/{name}")
-        
-        if not wheel_prim.HasAPI(UsdPhysics.MaterialAPI):
-            mat = UsdPhysics.MaterialAPI.Apply(wheel_prim)
-        else:
-            mat = UsdPhysics.MaterialAPI(wheel_prim)
-        
-        mat.CreateStaticFrictionAttr().Set(2.0)   # VERY high friction
-        mat.CreateDynamicFrictionAttr().Set(1.5)
-        
-        wheels.append(wheel)
+            actual_path = path
+            print(f"  ✓ Found at: {path}\n")
+            break
+        except Exception as e:
+            continue
     
-    print("✓ Test vehicle created\n")
+    if f1tenth is None:
+        print("  ❌ Could not create articulation")
+        print("\n  The robot loaded but can't find articulation root")
+        print("  Open Isaac Sim → Window → Stage to find correct path")
+        simulation_app.close()
+        return
     
-    # Reset
+    # Reset world
+    print("Step 5: Resetting world...")
     my_world.reset()
+    print("✓ World reset\n")
     
     print("="*70)
-    print("PHYSICS TEST")
+    print("ROBOT LOADED SUCCESSFULLY")
     print("="*70)
-    print("\nApplying constant forward force to chassis...")
-    print("If physics works, the box should slide forward\n")
+    print(f"Articulation path: {actual_path}")
+    print(f"Number of DOFs: {f1tenth.num_dof}")
+    print("\nJoint configuration:")
+    for i, name in enumerate(f1tenth.dof_names):
+        print(f"  [{i}] {name}")
+    print("="*70 + "\n")
+    
+    print("🎬 Starting movement test...")
+    print("Driving forward with properly imported URDF\n")
     
     i = 0
     start_pos = None
@@ -91,44 +140,97 @@ def main():
         my_world.step(render=True)
         
         if my_world.is_playing():
-            position, _ = chassis.get_world_pose()
+            position, _ = f1tenth.get_world_pose()
             
             if start_pos is None:
                 start_pos = position.copy()
             
-            # Apply forward force
-            chassis.apply_force(force=np.array([50.0, 0.0, 0.0]))  # Push forward
+            # Calculate phase (3 seconds each)
+            seconds = i / 60.0
+            phase = int(seconds / 3) % 3
             
+            # Create commands
+            velocities = np.zeros(6)
+            positions = np.zeros(6)
+            
+            if phase == 0:
+                # Forward
+                velocities[0] = 50.0  # left rear
+                velocities[2] = 50.0  # right rear
+                velocities[4] = 50.0  # left front
+                velocities[5] = 50.0  # right front
+                positions[1] = 0.0    # straight
+                positions[3] = 0.0
+                phase_name = "Forward"
+                
+            elif phase == 1:
+                # Forward + Left
+                velocities[0] = 50.0
+                velocities[2] = 50.0
+                velocities[4] = 50.0
+                velocities[5] = 50.0
+                positions[1] = 0.4    # left turn
+                positions[3] = 0.4
+                phase_name = "Turn Left"
+                
+            else:
+                # Forward + Right
+                velocities[0] = 50.0
+                velocities[2] = 50.0
+                velocities[4] = 50.0
+                velocities[5] = 50.0
+                positions[1] = -0.4   # right turn
+                positions[3] = -0.4
+                phase_name = "Turn Right"
+            
+            # Apply commands
+            f1tenth.set_joint_velocities(velocities)
+            f1tenth.set_joint_positions(positions)
+            
+            # Status every second
             if i % 60 == 0:
                 distance = np.linalg.norm(position - start_pos)
-                moved = distance > 0.05
-                status = "✅ PHYSICS WORKS!" if moved else "❌ Stuck"
+                actual_vels = f1tenth.get_joint_velocities()
+                wheel_vel = actual_vels[0] if len(actual_vels) > 0 else 0
                 
-                print(f"[{i//60:2d}s] Pos: [{position[0]:6.2f}, {position[1]:6.2f}, {position[2]:5.2f}] | "
-                      f"Moved: {distance:6.3f}m | {status}")
+                moved = distance > 0.02
+                status = "✅ MOVING!" if moved else "❌ Stuck"
+                
+                print(f"[{seconds:5.1f}s] {phase_name:12s} | "
+                      f"Pos: [{position[0]:6.2f}, {position[1]:6.2f}, {position[2]:5.2f}] | "
+                      f"Moved: {distance:6.3f}m | WheelVel: {wheel_vel:6.1f} | {status}")
+                
+                if moved and i > 120:
+                    print("\n" + "="*70)
+                    print("🎉 SUCCESS! URDF import worked perfectly!")
+                    print("="*70)
+                    print(f"Robot moved {distance:.3f} meters in {seconds:.1f} seconds")
+                    print("\nThe robot is now working with:")
+                    print("  ✓ Proper collision from STL meshes")
+                    print("  ✓ Movable base (fix_base=False)")
+                    print("  ✓ Correct joint drives")
+                    print("\nReady for jump course!")
+                    print("="*70 + "\n")
             
-            if i > 300:  # 5 seconds
+            # Stop after 12 seconds or if moved too far
+            if i > 720 or np.linalg.norm(position - start_pos) > 10.0:
                 distance = np.linalg.norm(position - start_pos)
                 
                 print("\n" + "="*70)
-                print("RESULT")
+                print("TEST COMPLETE")
                 print("="*70)
                 
                 if distance > 0.1:
-                    print(f"\n✅ Physics works! Box moved {distance:.3f} meters")
-                    print("\nThis means:")
-                    print("  → Isaac Sim physics is working fine")
-                    print("  → Your F1Tenth USD file is the problem")
-                    print("  → The collision geometry in USD is broken")
-                    print("\nSolution:")
-                    print("  1. Try: f1tenth_add_collisions.py")
-                    print("  2. Or re-import URDF with fixed settings")
+                    print(f"\n✅ SUCCESS! Robot moved {distance:.3f} meters")
+                    print("\nURDF import worked correctly!")
+                    print("Collision geometry is functional")
+                    print("\nNext: Run f1tenth_jump_course_official.py for full course")
                 else:
-                    print(f"\n❌ Physics not working! Box only moved {distance:.4f}m")
-                    print("\nThis means:")
-                    print("  → Something wrong with Isaac Sim setup")
-                    print("  → Check if PhysX is enabled")
-                    print("  → Try restarting Isaac Sim")
+                    print(f"\n⚠️  Robot only moved {distance:.4f}m")
+                    print("\nPossible issues:")
+                    print("  1. Mesh files not found - check meshes/ folder")
+                    print("  2. Collision geometry in STL is wrong")
+                    print("  3. URDF collision definitions need fixing")
                 
                 print("="*70 + "\n")
                 break
