@@ -1,83 +1,103 @@
 """
-F1Tenth - Add Wheel Collisions
-Adds proper collision cylinders and friction to wheels
+F1Tenth Jump Course - FLIPPED RAMPS
+All ramps are rotated 180 degrees to face opposite direction
 """
 
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": False})
 
 import numpy as np
-from omni.isaac.core import World
-from omni.isaac.core.articulations import Articulation
-from omni.isaac.core.utils.stage import add_reference_to_stage
-from pxr import UsdPhysics, UsdGeom, PhysxSchema, Gf
+import omni.kit.commands
+from isaacsim.core.api import World
+from isaacsim.core.prims import SingleArticulation
+from omni.isaac.core.objects import FixedCuboid, VisualCuboid
+from isaacsim.asset.importer.urdf import _urdf
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-USD_PATH = "/home/nail/Desktop/F1-Vault/urdf/f1-tenth_corrected/f1-tenth_corrected.usd"
+URDF_PATH = "/home/nail/Desktop/F1-Vault/urdf/f1-tenth_corrected.urdf"
 
-def add_wheel_collision_and_friction(stage, wheel_path, radius=0.05, width=0.045):
-    """
-    Add collision cylinder and friction material to a wheel
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+def quaternion_multiply(q1, q2):
+    """Multiply two quaternions [w, x, y, z]"""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
     
-    Args:
-        stage: USD stage
-        wheel_path: Path to wheel prim (e.g., "/World/F1Tenth/car_1_left_rear_wheel")
-        radius: Wheel radius in meters
-        width: Wheel width in meters
-    """
-    wheel_prim = stage.GetPrimAtPath(wheel_path)
-    
-    if not wheel_prim.IsValid():
-        print(f"  ❌ Wheel not found: {wheel_path}")
-        return False
-    
-    print(f"  Configuring: {wheel_path}")
-    
-    # Create collision shape path
-    collision_path = f"{wheel_path}/collision_cylinder"
-    
-    # Check if collision already exists
-    collision_prim = stage.GetPrimAtPath(collision_path)
-    if not collision_prim.IsValid():
-        # Create cylinder for collision
-        collision_prim = UsdGeom.Cylinder.Define(stage, collision_path)
-        print(f"    → Created collision cylinder")
-    else:
-        collision_prim = UsdGeom.Cylinder(collision_prim)
-    
-    # Set cylinder dimensions
-    collision_prim.GetRadiusAttr().Set(radius)
-    collision_prim.GetHeightAttr().Set(width)
-    collision_prim.GetAxisAttr().Set("Z")  # Z-axis aligned (horizontal wheel)
-    
-    # Add collision API
-    if not collision_prim.GetPrim().HasAPI(UsdPhysics.CollisionAPI):
-        UsdPhysics.CollisionAPI.Apply(collision_prim.GetPrim())
-        print(f"    → Added CollisionAPI")
-    
-    # Add physics material with friction
-    if not collision_prim.GetPrim().HasAPI(UsdPhysics.MaterialAPI):
-        material_api = UsdPhysics.MaterialAPI.Apply(collision_prim.GetPrim())
-    else:
-        material_api = UsdPhysics.MaterialAPI(collision_prim.GetPrim())
-    
-    # Set friction values
-    material_api.CreateStaticFrictionAttr().Set(1.0)   # High static friction
-    material_api.CreateDynamicFrictionAttr().Set(0.9)  # High dynamic friction
-    material_api.CreateRestitutionAttr().Set(0.1)      # Low bounce
-    print(f"    → Added friction (static=1.0, dynamic=0.9)")
-    
-    # Add PhysX material for better control
-    if not collision_prim.GetPrim().HasAPI(PhysxSchema.PhysxMaterialAPI):
-        physx_mat = PhysxSchema.PhysxMaterialAPI.Apply(collision_prim.GetPrim())
-    
-    return True
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2
+    ])
 
+def create_flipped_ramp(world, name, position, length=2.0, width=1.5, angle_deg=25):
+    """Create a launch ramp FLIPPED 180 degrees"""
+    print(f"  Creating {name} ({angle_deg}° angle, FLIPPED)...")
+    
+    # Flat approach section - FLIPPED
+    base = world.scene.add(
+        FixedCuboid(
+            prim_path=f"/World/Ramps/{name}_base",
+            name=f"{name}_base",
+            position=np.array([position[0] + length*0.6, position[1], position[2] + 0.05]),  # +0.6 instead of -0.6
+            scale=np.array([length*0.5, width, 0.1]),
+            color=np.array([0.3, 0.3, 0.3])
+        )
+    )
+    
+    # Angled launch section - FLIPPED
+    angle_rad = np.radians(angle_deg)
+    ramp_height = length * np.sin(angle_rad) / 2
+    
+    ramp = world.scene.add(
+        FixedCuboid(
+            prim_path=f"/World/Ramps/{name}_ramp",
+            name=f"{name}_ramp",
+            position=np.array([position[0], position[1], position[2] + ramp_height/2]),
+            scale=np.array([length, width, 0.15]),
+            color=np.array([1.0, 0.4, 0.0])  # Orange
+        )
+    )
+    
+    # Create rotation: tilt + 180-degree flip
+    # Tilt rotation (around Y-axis)
+    tilt_quat = np.array([np.cos(angle_rad / 2), 0, np.sin(angle_rad / 2), 0])
+    
+    # 180-degree rotation around Z-axis (vertical flip)
+    flip_quat = np.array([0, 0, 0, 1])  # 180° around Z
+    
+    # Combine rotations
+    final_quat = quaternion_multiply(flip_quat, tilt_quat)
+    
+    ramp.set_world_pose(
+        position=np.array([position[0], position[1], position[2] + ramp_height/2]),
+        orientation=final_quat
+    )
+    
+    return base, ramp
+
+def create_landing_zone(world, name, position, size=3.0):
+    """Create green landing zone marker"""
+    landing = world.scene.add(
+        VisualCuboid(
+            prim_path=f"/World/Ramps/{name}_landing",
+            name=f"{name}_landing",
+            position=np.array([position[0], position[1], position[2] + 0.01]),
+            scale=np.array([size, size, 0.02]),
+            color=np.array([0.2, 0.8, 0.2])  # Green
+        )
+    )
+    return landing
+
+# ============================================================================
+# MAIN
+# ============================================================================
 def main():
     print("\n" + "="*70)
-    print("F1TENTH - ADD WHEEL COLLISIONS & FRICTION")
+    print("🏁 F1TENTH JUMP COURSE - FLIPPED RAMPS (180°) 🏁")
     print("="*70 + "\n")
     
     # Create world
@@ -86,132 +106,249 @@ def main():
     my_world.scene.add_default_ground_plane()
     print("✓ World created\n")
     
-    # Load robot
-    print("Step 2: Loading robot...")
-    add_reference_to_stage(usd_path=USD_PATH, prim_path="/World/F1Tenth")
-    print("✓ Robot loaded\n")
+    # Build jump course with FLIPPED ramps
+    print("Step 2: Building jump course (all ramps FLIPPED 180°)...\n")
     
-    # Get stage
-    stage = my_world.stage
+    print("  🔺 Ramp 1: Easy Jump (FLIPPED)")
+    create_flipped_ramp(my_world, "ramp1", [6.0, 0.0, 0.0], length=2.5, angle_deg=20)
+    create_landing_zone(my_world, "landing1", [3.0, 0.0, 0.0], size=3.0)  # Landing before ramp now
     
-    # Add collision to all 4 wheels
-    print("Step 3: Adding collision shapes and friction to wheels...")
+    print("  🔺 Ramp 2: Medium Jump (FLIPPED)")
+    create_flipped_ramp(my_world, "ramp2", [3.0, -8.0, 0.0], length=3.0, angle_deg=28)
+    create_landing_zone(my_world, "landing2", [-1.0, -8.0, 0.0], size=3.5)
     
-    wheel_configs = [
-        ("car_1_left_rear_wheel", 0.05, 0.045),
-        ("car_1_right_rear_wheel", 0.05, 0.045),
-        ("car_1_left_front_wheel", 0.05, 0.045),
-        ("car_1_right_front_wheel", 0.05, 0.045),
+    print("  🔺 Ramp 3: Big Jump (FLIPPED)")
+    create_flipped_ramp(my_world, "ramp3", [-6.0, -3.0, 0.0], length=3.5, angle_deg=30)
+    create_landing_zone(my_world, "landing3", [-11.0, -3.0, 0.0], size=4.0)
+    
+    print("\n✓ Course built: 3 FLIPPED ramps + landing zones\n")
+    
+    # Configure URDF import
+    print("Step 3: Configuring URDF import settings...")
+    
+    import_config = _urdf.ImportConfig()
+    import_config.merge_fixed_joints = False
+    import_config.convex_decomp = False
+    import_config.fix_base = False  # CRITICAL!
+    import_config.make_default_prim = True
+    import_config.self_collision = False
+    import_config.create_physics_scene = True
+    import_config.import_inertia_tensor = True
+    import_config.default_drive_strength = 10000.0
+    import_config.default_position_drive_damping = 1000.0
+    import_config.default_drive_type = _urdf.UrdfJointTargetType.JOINT_DRIVE_VELOCITY
+    import_config.distance_scale = 1.0
+    import_config.density = 0.0
+    
+    print("✓ Config ready\n")
+    
+    # Import URDF
+    print("Step 4: Importing F1Tenth URDF...")
+    print(f"  File: {URDF_PATH}")
+    
+    try:
+        result, prim_path = omni.kit.commands.execute(
+            "URDFParseAndImportFile",
+            urdf_path=URDF_PATH,
+            import_config=import_config,
+        )
+        
+        if not result:
+            print("❌ Import failed!")
+            simulation_app.close()
+            return
+        
+        print(f"✓ URDF imported at: {prim_path}\n")
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        simulation_app.close()
+        return
+    
+    # Find articulation root
+    print("Step 5: Creating articulation...")
+    
+    possible_paths = [
+        prim_path,
+        f"{prim_path}/car_1_base_link",
+        "/car_1_base_link",
     ]
     
-    fixed_count = 0
-    for wheel_name, radius, width in wheel_configs:
-        wheel_path = f"/World/F1Tenth/{wheel_name}"
-        if add_wheel_collision_and_friction(stage, wheel_path, radius, width):
-            fixed_count += 1
+    f1tenth = None
     
-    print(f"\n✓ Fixed {fixed_count}/4 wheels\n")
+    for path in possible_paths:
+        try:
+            print(f"  Trying: {path}")
+            f1tenth = my_world.scene.add(
+                SingleArticulation(prim_path=path, name="f1tenth")
+            )
+            print(f"  ✓ Success!\n")
+            break
+        except:
+            continue
     
-    # Create articulation
-    print("Step 4: Creating articulation...")
-    f1tenth = my_world.scene.add(
-        Articulation(
-            prim_path="/World/F1Tenth/car_1_base_link",
-            name="f1tenth"
-        )
-    )
-    print("✓ Articulation created\n")
+    if f1tenth is None:
+        print("❌ Could not create articulation")
+        simulation_app.close()
+        return
     
-    # Reset world
-    print("Step 5: Resetting world...")
+    # Reset
+    print("Step 6: Resetting world...")
     my_world.reset()
-    print("✓ World reset\n")
+    print("✓ Ready!\n")
     
     print("="*70)
-    print("TESTING MOVEMENT WITH COLLISION FIX")
+    print("🎬 STARTING AUTONOMOUS JUMP SEQUENCE (FLIPPED RAMPS)")
+    print("="*70)
+    print(f"Robot DOFs: {f1tenth.num_dof}")
+    print(f"Note: Ramps now face OPPOSITE direction!")
     print("="*70 + "\n")
     
-    print("🎬 Applying STRONG drive commands...\n")
+    # Driving sequence - ADJUSTED for flipped ramps
+    driving_sequence = [
+        # === RAMP 1: EASY JUMP (now approach from opposite side) ===
+        (2.0,  0.0, 1.5),   # Approach
+        (1.5,  0.0, 3.5),   # 🚀 BOOST for jump!
+        (1.0,  0.0, 2.0),   # Landing
+        
+        # === NAVIGATE TO RAMP 2 ===
+        (2.0, -0.4, 1.8),   # Turn right
+        (1.0, -0.3, 2.0),   # Continue turn
+        (1.0,  0.0, 1.5),   # Straighten out
+        
+        # === RAMP 2: MEDIUM JUMP ===
+        (1.0,  0.0, 2.5),   # Speed up
+        (1.2,  0.0, 4.0),   # 🚀 BIG BOOST!
+        (1.0,  0.0, 2.0),   # Landing
+        
+        # === NAVIGATE TO RAMP 3 ===
+        (2.0,  0.5, 1.8),   # Turn left
+        (1.5,  0.4, 2.0),   # Continue turn
+        (1.5,  0.1, 2.0),   # Adjust heading
+        
+        # === RAMP 3: BIG JUMP ===
+        (1.0,  0.0, 3.0),   # Build up speed
+        (1.5,  0.0, 4.5),   # 🚀 MEGA BOOST!
+        (1.5,  0.0, 2.0),   # Landing
+        
+        # === RETURN TO START ===
+        (3.0, -0.3, 2.0),   # Navigate back
+        (2.0,  0.0, 1.5),   # Slow down to start
+    ]
     
+    # Simulation variables
     i = 0
-    start_pos = None
+    seq_idx = 0
+    seq_timer = 0
+    lap = 1
+    max_height = 0.0
+    air_time_frames = 0
+    jump_count = 0
+    last_airborne = False
     
     while simulation_app.is_running():
         my_world.step(render=True)
         
         if my_world.is_playing():
             position, _ = f1tenth.get_world_pose()
+            velocity = f1tenth.get_linear_velocity()
+            speed = np.linalg.norm(velocity)
             
-            if start_pos is None:
-                start_pos = position.copy()
+            # Track maximum jump height
+            if position[2] > max_height:
+                max_height = position[2]
             
-            # Apply STRONG velocity commands
+            # Track air time and count jumps
+            is_airborne = position[2] > 0.2
+            if is_airborne:
+                air_time_frames += 1
+                if not last_airborne:
+                    jump_count += 1
+                    print(f"    💥 JUMP #{jump_count}! Current height: {position[2]:.2f}m")
+            last_airborne = is_airborne
+            
+            # Get current command from sequence
+            if seq_idx < len(driving_sequence):
+                duration, steering, velocity_ms = driving_sequence[seq_idx]
+                frames = duration * 60
+                
+                if seq_timer >= frames:
+                    seq_idx += 1
+                    seq_timer = 0
+                else:
+                    seq_timer += 1
+            else:
+                steering, velocity_ms = 0.0, 0.0
+            
+            # Create joint commands
             velocities = np.zeros(6)
-            velocities[0] = 50.0  # Very fast
-            velocities[2] = 50.0
-            velocities[4] = 50.0
-            velocities[5] = 50.0
-            
-            # Also apply torque
-            efforts = np.zeros(6)
-            efforts[0] = 100.0
-            efforts[2] = 100.0
-            efforts[4] = 100.0
-            efforts[5] = 100.0
-            
-            f1tenth.set_joint_velocities(velocities)
-            f1tenth.set_joint_efforts(efforts)
-            
-            # Straight steering
             positions = np.zeros(6)
+            
+            # Convert m/s to rad/s
+            wheel_angular_vel = velocity_ms / 0.05
+            
+            # Set all wheel velocities
+            velocities[0] = wheel_angular_vel  # left rear
+            velocities[2] = wheel_angular_vel  # right rear
+            velocities[4] = wheel_angular_vel  # left front
+            velocities[5] = wheel_angular_vel  # right front
+            
+            # Set steering angles
+            positions[1] = steering  # left steering
+            positions[3] = steering  # right steering
+            
+            # Apply commands
+            f1tenth.set_joint_velocities(velocities)
             f1tenth.set_joint_positions(positions)
             
-            # Check movement
+            # Print telemetry every second
             if i % 60 == 0:
-                distance = np.linalg.norm(position - start_pos)
-                actual_vels = f1tenth.get_joint_velocities()
-                wheel_vel = actual_vels[0] if len(actual_vels) > 0 else 0
-                
-                moved = distance > 0.02  # Allow small threshold
-                status = "✅ MOVING!" if moved else "❌ Still stuck"
-                
-                print(f"[{i//60:2d}s] Pos: [{position[0]:6.2f}, {position[1]:6.2f}, {position[2]:5.2f}] | "
-                      f"Moved: {distance:6.3f}m | WheelVel: {wheel_vel:6.1f} | {status}")
-                
-                if moved and i > 60:
-                    print("\n" + "="*70)
-                    print("🎉 SUCCESS! Wheels now have collision and friction!")
-                    print("="*70)
-                    print(f"Robot moved {distance:.3f} meters")
-                    print("The collision fix worked! You can now use this for jump course")
-                    print("="*70 + "\n")
-            
-            # Stop after 10 seconds
-            if i > 600:
-                distance = np.linalg.norm(position - start_pos)
-                
-                print("\n" + "="*70)
-                print("TEST COMPLETE")
-                print("="*70)
-                print(f"Total distance: {distance:.4f} meters")
-                
-                if distance > 0.05:
-                    print("\n✅ SUCCESS! Robot is moving with collision fix!")
-                    print("\nNext steps:")
-                    print("  1. This fix is temporary (in memory only)")
-                    print("  2. To make permanent, save the modified stage")
-                    print("  3. Or re-import URDF with better collision settings")
+                # Determine phase name
+                if velocity_ms > 3.0:
+                    phase = "🚀 BOOST!"
+                elif abs(steering) > 0.2:
+                    phase = "↻ Turning"
                 else:
-                    print("\n⚠️  Still not moving much")
-                    print("\nThe USD file may have deeper issues.")
-                    print("Consider re-importing URDF from scratch.")
+                    phase = "→ Cruising"
                 
-                print("="*70 + "\n")
-                break
+                # Airborne indicator
+                airborne = "✈️  FLYING!" if is_airborne else ""
+                
+                print(f"[Lap {lap}] {phase:12s} | "
+                      f"Pos: [{position[0]:5.1f}, {position[1]:5.1f}, {position[2]:4.2f}] | "
+                      f"Speed: {speed:4.1f} m/s | "
+                      f"MaxH: {max_height:4.2f}m | "
+                      f"Jumps: {jump_count} {airborne}")
+            
+            # Reset on lap completion or fall
+            if position[2] < -0.3 or seq_idx >= len(driving_sequence):
+                air_time_sec = air_time_frames / 60.0
+                
+                print(f"\n{'='*70}")
+                print(f"🏁 LAP {lap} COMPLETE!")
+                print(f"{'='*70}")
+                print(f"  Max jump height: {max_height:.2f} meters")
+                print(f"  Total jumps: {jump_count}")
+                print(f"  Total air time: {air_time_sec:.1f} seconds")
+                print(f"  Course time: {i/60.0:.1f} seconds")
+                print(f"{'='*70}\n")
+                
+                # Reset for next lap
+                my_world.reset()
+                lap += 1
+                seq_idx = 0
+                seq_timer = 0
+                max_height = 0.0
+                air_time_frames = 0
+                jump_count = 0
+                last_airborne = False
+                i = 0
+                continue
             
             i += 1
     
     simulation_app.close()
+    print("\n🏁 Simulation ended")
 
 if __name__ == "__main__":
     main()
