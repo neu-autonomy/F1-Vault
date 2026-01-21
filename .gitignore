@@ -1,7 +1,3 @@
-# Data
-data/
-*.hdf5
-*.h5
 
 # Python
 __pycache__/
