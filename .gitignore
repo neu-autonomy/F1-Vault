@@ -23,3 +23,7 @@ wandb/
 .vscode/
 .idea/
 *.swp
+
+figures/
+notebooks/
+models/
