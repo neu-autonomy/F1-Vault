@@ -1,3 +1,16 @@
+"""
+Baseline MLP Dynamics Model Training
+
+This script trains a simple feedforward neural network to predict next state
+given current state and action. The goal is to test if the dynamics are learnable
+from the collected data.
+
+Task: Learn f(state_t, action_t) -> state_{t+1}
+
+Author: [Your Name]
+Date: 2026-01-31
+"""
+
 import h5py
 import numpy as np
 import torch
@@ -9,62 +22,66 @@ from pathlib import Path
 from tqdm import tqdm
 import argparse
 
-"""
-Config class to specify data/model sizes, devices, and files.
-"""
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
 class Config:
     # Data
     data_file = 'data/raw/dynamics_data_0000.h5'
-    elevation_map_size = 676 # 26 x 26
+    elevation_map_size = 676  # 26x26 grid
     
-    # Model
-    hidden_dims = [512, 512, 512]
+    # Model architecture
+    hidden_dims = [256, 256]  # 2 hidden layers (smaller for faster training)
     activation = 'relu'
     dropout = 0.1
     
     # Training
-    batch_size = 256
+    batch_size = 512  # Larger batches for faster training
     learning_rate = 1e-3
     weight_decay = 1e-5
-    num_epochs = 50
+    num_epochs = 25  # Fewer epochs for baseline
     val_split = 0.2
     
     # Prediction target
-    predict_delta = True  # predict (s_{t+1} - s_t) instead of s_{t+1}
+    predict_delta = True  # Predict (s_{t+1} - s_t) instead of s_{t+1}
     
     # Preprocessing
     normalize_states = True
     normalize_actions = True
-    handle_inf_elevation = True  # inf --> sentinel value
+    handle_inf_elevation = True  # Replace inf with sentinel value
     
     # Output
     save_dir = Path('models/baseline_dynamics')
-    checkpoint_every = 10
+    checkpoint_every = 10  # Save checkpoint every N epochs
     
-    # Device
-    device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+    # Device - Force CUDA
+    device = 'cuda'
 
 
-"""
-Dataset processing for dynamics model training.
-"""
-class DynamicsDataset(Dataset):    
-    """
-    Args:
-        states: (N, state_dim) current states
-        actions: (N, action_dim) actions taken
-        next_states: (N, state_dim) resulting next states
-        config: Config object
-    """
+# ============================================================================
+# DATASET
+# ============================================================================
+
+class DynamicsDataset(Dataset):
+    """Dataset for dynamics model training."""
+    
     def __init__(self, states, actions, next_states, config):
+        """
+        Args:
+            states: (N, state_dim) current states
+            actions: (N, action_dim) actions taken
+            next_states: (N, state_dim) resulting next states
+            config: Config object
+        """
         self.config = config
         
-        # Handle inf values in elevation maps
+        # Handle inf values in elevation maps if needed
         if config.handle_inf_elevation:
             states = self._handle_inf(states.copy())
             next_states = self._handle_inf(next_states.copy())
         
-        # Compute state deltas
+        # Compute state deltas if needed
         if config.predict_delta:
             self.targets = next_states - states  # Predict change
         else:
@@ -83,18 +100,18 @@ class DynamicsDataset(Dataset):
         self.target_mean = self.targets.mean(axis=0)
         self.target_std = self.targets.std(axis=0) + 1e-8
         
-        # print(f"Dataset size: {len(states):,} transitions")
-        # print(f"State dim: {states.shape[1]}")
-        # print(f"Action dim: {actions.shape[1]}")
-        # print(f"Predicting: {'state deltas' if config.predict_delta else 'next states'}")
+        print(f"Dataset size: {len(states):,} transitions")
+        print(f"State dim: {states.shape[1]}")
+        print(f"Action dim: {actions.shape[1]}")
+        print(f"Predicting: {'state deltas' if config.predict_delta else 'next states'}")
     
-    """
-    Replace inf values with a large negative sentinel.
-    """
     def _handle_inf(self, data):
+        """Replace inf values with a large negative sentinel."""
+        # Assume elevation map is last 625 or 676 values
         elevation_size = self.config.elevation_map_size
         elevation_maps = data[:, -elevation_size:]
         
+        # Replace inf with -10.0 (well below terrain)
         inf_mask = np.isinf(elevation_maps)
         if inf_mask.any():
             print(f"  Replacing {inf_mask.sum():,} inf values in elevation maps")
@@ -126,10 +143,13 @@ class DynamicsDataset(Dataset):
         )
 
 
-"""
-MLP model for dynamics prediction.
-"""
+# ============================================================================
+# MODEL
+# ============================================================================
+
 class DynamicsMLP(nn.Module):
+    """Simple MLP for dynamics prediction."""
+    
     def __init__(self, state_dim, action_dim, hidden_dims, dropout=0.1):
         super().__init__()
         
@@ -151,29 +171,31 @@ class DynamicsMLP(nn.Module):
         
         self.network = nn.Sequential(*layers)
         
-        # print(f"\nModel Architecture:")
-        # print(f"  Input: {input_dim} (state + action)")
-        # print(f"  Hidden layers: {hidden_dims}")
-        # print(f"  Output: {output_dim} (state)")
-        # total_params = sum(p.numel() for p in self.parameters())
-        # print(f"  Total parameters: {total_params:,}")
+        print(f"\nModel Architecture:")
+        print(f"  Input: {input_dim} (state + action)")
+        print(f"  Hidden layers: {hidden_dims}")
+        print(f"  Output: {output_dim} (state)")
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"  Total parameters: {total_params:,}")
     
-    """
-    Args:
-        state: (batch, state_dim)
-        action: (batch, action_dim)
-    Returns:
-        predicted_next_state or predicted_delta: (batch, state_dim)
-    """
     def forward(self, state, action):
+        """
+        Args:
+            state: (batch, state_dim)
+            action: (batch, action_dim)
+        Returns:
+            predicted_next_state or predicted_delta: (batch, state_dim)
+        """
         x = torch.cat([state, action], dim=-1)
         return self.network(x)
 
 
-"""
-MLP Training.
-"""
+# ============================================================================
+# TRAINING
+# ============================================================================
+
 def train_epoch(model, loader, optimizer, criterion, device):
+    """Train for one epoch."""
     model.train()
     total_loss = 0
     
@@ -192,13 +214,13 @@ def train_epoch(model, loader, optimizer, criterion, device):
     
     return total_loss / len(loader.dataset)
 
-"""
-Evaluate on validation set.
-"""
+
 def eval_epoch(model, loader, criterion, device, dataset):
+    """Evaluate on validation set."""
     model.eval()
     total_loss = 0
     
+    # Track component-wise errors
     errors = []
     
     with torch.no_grad():
@@ -211,6 +233,7 @@ def eval_epoch(model, loader, criterion, device, dataset):
             loss = criterion(predictions, targets)
             total_loss += loss.item() * len(states)
             
+            # Denormalize for interpretable errors
             pred_denorm = predictions.cpu().numpy() * dataset.target_std + dataset.target_mean
             target_denorm = targets.cpu().numpy() * dataset.target_std + dataset.target_mean
             
@@ -223,10 +246,15 @@ def eval_epoch(model, loader, criterion, device, dataset):
 
 
 def compute_component_errors(errors, state_dim, elevation_map_size):
+    """Compute errors for different state components."""
+    # Assume state structure from documentation
+    # [pos(3), quat(4), euler(3), vel(3), angvel(3), vel_w(3), angvel_w(3), action(2), joints(?), elevation(625/676)]
+    
     core_dim = state_dim - elevation_map_size
     core_errors = errors[:, :core_dim]
     elevation_errors = errors[:, core_dim:]
     
+    # First few components
     pos_errors = errors[:, :3]  # XYZ position
     
     results = {
@@ -247,12 +275,14 @@ def compute_component_errors(errors, state_dim, elevation_map_size):
     return results
 
 
-"""
-Main client to run MLP.
-"""
+# ============================================================================
+# MAIN
+# ============================================================================
+
 def main(args):
     config = Config()
     
+    # Override config with args if provided
     if args.data_file:
         config.data_file = args.data_file
     if args.epochs:
@@ -260,11 +290,21 @@ def main(args):
     if args.batch_size:
         config.batch_size = args.batch_size
     
-    print("MLP Baseline Dynamics Model Training")
-    print("=" * 80)
+    # Verify CUDA is available
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available! Please check your PyTorch installation and GPU setup.")
     
+    print("=" * 80)
+    print("BASELINE DYNAMICS MODEL TRAINING")
+    print("=" * 80)
+    print(f"\n🚀 Using CUDA device: {torch.cuda.get_device_name(0)}")
+    print(f"   CUDA version: {torch.version.cuda}")
+    print(f"   PyTorch version: {torch.__version__}")
+    
+    # Create output directory
     config.save_dir.mkdir(parents=True, exist_ok=True)
     
+    # Load data
     print("\nLoading data...")
     with h5py.File(config.data_file, 'r') as f:
         states = f['states'][:]
@@ -280,8 +320,13 @@ def main(args):
         print(f"State dim: {state_dim}")
         print(f"Action dim: {action_dim}")
     
-    # Filter out episode boundary transitions
+    # CRITICAL: Filter out episode boundary transitions
+    print("\n⚠️  Filtering out episode boundaries (resets)...")
     valid_mask = ~(terminated | truncated)
+    
+    print(f"  Before filtering: {len(states):,} transitions")
+    print(f"  After filtering:  {valid_mask.sum():,} transitions ({100*valid_mask.sum()/len(states):.1f}%)")
+    print(f"  Removed: {(~valid_mask).sum():,} reset transitions")
     
     # Only keep valid transitions
     states = states[valid_mask]
@@ -290,11 +335,21 @@ def main(args):
     
     # Verify filtering worked
     pos_delta = next_states[:, :3] - states[:, :3]
+    print(f"\n✓ Filtered position deltas:")
+    print(f"  X: std={pos_delta[:,0].std():.4f}m, max={np.abs(pos_delta[:,0]).max():.4f}m")
+    print(f"  Y: std={pos_delta[:,1].std():.4f}m, max={np.abs(pos_delta[:,1]).max():.4f}m")
+    print(f"  Z: std={pos_delta[:,2].std():.4f}m, max={np.abs(pos_delta[:,2]).max():.4f}m")
     
     if np.abs(pos_delta).max() > 5.0:
-        print("\nWarning: there might be issues with transition data.")
+        print("\n⚠️  WARNING: Still seeing large position jumps (>5m)!")
+        print("  This suggests resets are still in the data or other issues exist.")
     
-    # Split data
+    # Check for NaN/inf
+    print("\nData quality checks:")
+    print(f"  States - NaN: {np.isnan(states).sum()}, Inf: {np.isinf(states).sum()}")
+    print(f"  Actions - NaN: {np.isnan(actions).sum()}, Inf: {np.isinf(actions).sum()}")
+    
+    # Split data (by index, not by episode - simple baseline)
     n_samples = len(states)
     n_train = int(n_samples * (1 - config.val_split))
     
@@ -302,6 +357,10 @@ def main(args):
     indices = np.random.permutation(n_samples)
     train_idx = indices[:n_train]
     val_idx = indices[n_train:]
+    
+    print(f"\nData split:")
+    print(f"  Train: {len(train_idx):,} samples ({100*(1-config.val_split):.0f}%)")
+    print(f"  Val:   {len(val_idx):,} samples ({100*config.val_split:.0f}%)")
     
     # Create datasets
     print("\nCreating datasets...")
@@ -327,15 +386,13 @@ def main(args):
     val_dataset.target_mean = train_dataset.target_mean
     val_dataset.target_std = train_dataset.target_std
     
-    # Create dataloaders
-    use_pin_memory = config.device == 'cuda'  # pin memory for CUDA
-    
+    # Create dataloaders with pin_memory for CUDA
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=4,
-        pin_memory=use_pin_memory
+        pin_memory=True  # Enable for CUDA
     )
     
     val_loader = DataLoader(
@@ -343,7 +400,7 @@ def main(args):
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=4,
-        pin_memory=use_pin_memory
+        pin_memory=True  # Enable for CUDA
     )
     
     # Create model
@@ -443,6 +500,7 @@ def main(args):
             }, config.save_dir / f'checkpoint_epoch_{epoch+1}.pt')
     
     print("\n" + "=" * 80)
+    print("Training complete!")
     print(f"Best validation loss: {best_val_loss:.6f}")
     
     # Plot training curves
@@ -460,7 +518,8 @@ def main(args):
     print(f"Saved: {config.save_dir / 'training_curves.png'}")
     
     # Final evaluation with component breakdown
-    print("\nFinal Evaluation")
+    print("\n" + "=" * 80)
+    print("FINAL EVALUATION")
     print("=" * 80)
     
     model.load_state_dict(torch.load(config.save_dir / 'best_model.pt', weights_only=False)['model_state_dict'])

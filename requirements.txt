@@ -1,6 +1,6 @@
 
 torch>=2.2.6
-numpy>=2.4.1
+numpy>=1.15.1
 h5py>=3.8.0
 pyyaml>=6.0
 matplotlib>=3.7.0
