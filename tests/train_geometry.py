@@ -68,7 +68,7 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device):
         
         # CHECK FOR NaN IMMEDIATELY
         if torch.isnan(loss):
-            print(f"\n  ✗ NaN loss at batch {batch_idx}!")
+            print(f"\n   NaN loss at batch {batch_idx}!")
             print(f"    Checking predictions...")
             for key, tensor in predictions.items():
                 has_nan = torch.isnan(tensor).any()
@@ -80,7 +80,7 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device):
         
         # CHECK FOR Inf
         if torch.isinf(loss):
-            print(f"\n  ✗ Inf loss at batch {batch_idx}!")
+            print(f"\n   Inf loss at batch {batch_idx}!")
             print(f"    Skipping batch {batch_idx}")
             continue
         
@@ -91,7 +91,7 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device):
         has_nan_grad = False
         for name, param in model.named_parameters():
             if param.grad is not None and torch.isnan(param.grad).any():
-                print(f"\n  ✗ NaN gradient in {name} at batch {batch_idx}")
+                print(f"\n   NaN gradient in {name} at batch {batch_idx}")
                 has_nan_grad = True
                 break
         
@@ -116,7 +116,7 @@ def train_one_epoch(model, train_loader, optimizer, loss_fn, device):
     
     # Compute average (only over valid batches)
     if valid_batches == 0:
-        print("\n  ✗ WARNING: No valid batches in this epoch!")
+        print("\n   WARNING: No valid batches in this epoch!")
         return float('nan')
     
     avg_loss = total_loss / valid_batches
