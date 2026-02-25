@@ -21,7 +21,7 @@ def get_points_from_robot_mesh(robot, voxel_size=0.1, return_mesh=False):
         robot = 'tradr'
     elif 'marv' in robot:
         robot = 'marv'
-    mesh_path = os.path.join(os.path.dirname(__file__), f'../../../../config/meshes/{robot}.obj')
+    mesh_path = os.path.join(os.path.dirname(__file__), f'../../robot_mesh/{robot}.obj')
     assert os.path.exists(mesh_path), f'Mesh file {mesh_path} does not exist.'
     mesh = o3d.io.read_triangle_mesh(mesh_path)
     pcd = o3d.geometry.PointCloud()
@@ -78,8 +78,8 @@ class DPhysConfig:
     def __init__(self, robot='marv', grid_res=0.1):
         # robot parameters
         self.robot = robot
-        self.vel_max = 1.0  # m/s
-        self.omega_max = 2.0  # rad/s
+        self.vel_max = 3.0  # m/s
+        self.omega_max = 6.0  # rad/s
         if 'tradr' in robot:
             self.robot_mass = 40.  # kg
             self.joint_positions = {
@@ -158,18 +158,27 @@ class DPhysConfig:
         """ 
 
         self.friction = 1.0 * torch.ones_like(self.z_grid)  # friction of the terrain
-        self.stiffness = 1e6  # stiffness of the terrain, [N/m]
-        self.damping = np.sqrt(4 * self.robot_mass * self.stiffness)  # critical damping
+        # self.stiffness = 1e6  # stiffness of the terrain, [N/m]
+        # self.damping = np.sqrt(4 * self.robot_mass * self.stiffness)  # critical damping
+        self.stiffness = 500.0  # Much smaller! Still rigid enough
+        self.damping = 50.0     # Fixed reasonable value
         self.hm_interp_method = None
 
         # trajectory shooting parameters
-        self.traj_sim_time = 5.0
-        self.dt = 0.01
+        self.traj_sim_time = 1.0
+        self.dt = 0.1
         self.n_sim_trajs = 64
+        self.use_odeint = False
         self.integration_mode = 'euler'  # 'euler', 'rk4'
 
         # using odeint for integration or not, from torchdiffeq: https://github.com/rtqichen/torchdiffeq
         self.use_odeint = True
+
+        self.control_mode = "throttle_steer"
+        self.throttle_to_v = 3.0 #sacled to robot target velocity
+        self.steer_to_delta = 0.488
+        self.wheelbase = 0.33 #tune if known, customize to robot used
+        self.omega_clip = 6.0 #safety clamp
 
     def __str__(self):
         return str(self.__dict__)

@@ -164,7 +164,9 @@ class DPhysics(torch.nn.Module):
 
         # simulation (prediction) parameters: time horizon and step size
         T, dt = self.dphys_cfg.traj_sim_time, self.dphys_cfg.dt
-        self.ts = torch.linspace(0, T, int(T / dt)).to(self.device)
+        # self.ts = torch.linspace(0, T, int(T / dt)).to(self.device)
+        N = int(round(T / dt)) + 1
+        self.ts = torch.arange(N, device=self.device, dtype=torch.float32) * dt
 
         # integration method: odeint or custom
         self.integrator = self.dynamics_odeint if self.dphys_cfg.use_odeint else self.dynamics
@@ -419,9 +421,15 @@ class DPhysics(torch.nn.Module):
         x_i = ((x_query_flat + d_max) / grid_res).long()
         y_i = ((y_query_flat + d_max) / grid_res).long()
 
+        x_i = torch.clamp(x_i, 0, H - 2)
+        y_i = torch.clamp(y_i, 0, W - 2)
+
         # Compute the fractional part of the indices
         x_frac = (x_query_flat + d_max) / grid_res - x_i.float()
         y_frac = (y_query_flat + d_max) / grid_res - y_i.float()
+
+        x_frac = x_frac.clamp(0.0, 1.0)
+        y_frac = y_frac.clamp(0.0, 1.0)
 
         # Compute the indices of the grid points
         i_c = y_i + H * x_i
@@ -549,6 +557,26 @@ class DPhysics(torch.nn.Module):
         dt = self.dphys_cfg.dt
         T = self.dphys_cfg.traj_sim_time
         batch_size = z_grid.shape[0]
+
+        # --- NEW: allow (throttle, steering) in [-1,1] and convert to (v, omega)
+        if getattr(self.dphys_cfg, "control_mode", "vw") == "throttle_steer":
+            throttle = controls[..., 0].clamp(-1.0, 1.0)
+            steering = controls[..., 1].clamp(-1.0, 1.0)
+
+            # dataset scaling (from your docs)
+            v = throttle * float(getattr(self.dphys_cfg, "throttle_to_v", 3.0))        # m/s
+            delta = steering * float(getattr(self.dphys_cfg, "steer_to_delta", 0.488)) # rad
+
+            # bicycle approx: delta -> yaw rate
+            L = float(getattr(self.dphys_cfg, "wheelbase", 0.33))
+            omega = (v / max(L, 1e-6)) * torch.tan(delta)
+
+            # safety clamp
+            omega_clip = float(getattr(self.dphys_cfg, "omega_clip", 6.0))
+            omega = omega.clamp(-omega_clip, omega_clip)
+
+            controls = torch.stack([v, omega], dim=-1)
+    # --- END NEW
 
         # initial state
         if state is None:
