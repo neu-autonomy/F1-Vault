@@ -9,171 +9,231 @@ from pathlib import Path
 from tqdm import tqdm
 import argparse
 
-"""
-Config class to specify data/model sizes, devices, and files.
-"""
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
 class Config:
     # Data
     data_file = 'data/raw/dynamics_data_0000.h5'
-    elevation_map_size = 676 # 26 x 26
+    elevation_map_size = 676  # 26x26 grid
     
-    # Model
-    hidden_dims = [512, 512, 512]
-    activation = 'relu'
-    dropout = 0.1
+    # Sequence parameters
+    sequence_length = 5  # Use last 5 timesteps (0.5 seconds of history)
+    
+    # Model architecture
+    hidden_size = 256  # LSTM hidden state size
+    num_layers = 2     # Number of LSTM layers
+    dropout = 0.2
     
     # Training
-    batch_size = 256
+    batch_size = 256   # Smaller batch for sequences (more memory)
     learning_rate = 1e-3
     weight_decay = 1e-5
     num_epochs = 50
     val_split = 0.2
     
     # Prediction target
-    predict_delta = True  # predict (s_{t+1} - s_t) instead of s_{t+1}
+    predict_delta = True  # Predict change in state
     
     # Preprocessing
     normalize_states = True
     normalize_actions = True
-    handle_inf_elevation = True  # inf --> sentinel value
+    handle_inf_elevation = True
     
     # Output
-    save_dir = Path('models/baseline_dynamics')
+    save_dir = Path('models/rnn_dynamics')
     checkpoint_every = 10
     
     # Device
     device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
 
 
-"""
-Dataset processing for dynamics model training.
-"""
-class DynamicsDataset(Dataset):    
-    """
-    Args:
-        states: (N, state_dim) current states
-        actions: (N, action_dim) actions taken
-        next_states: (N, state_dim) resulting next states
-        config: Config object
-    """
-    def __init__(self, states, actions, next_states, config):
+# ============================================================================
+# DATASET (Sequence-based)
+# ============================================================================
+
+class SequenceDynamicsDataset(Dataset):
+    """Dataset that creates sequences for RNN training."""
+    
+    def __init__(self, states, actions, next_states, episode_ids, config):
+        """
+        Args:
+            states: (N, state_dim) current states
+            actions: (N, action_dim) actions taken
+            next_states: (N, state_dim) resulting next states
+            episode_ids: (N,) which episode each transition belongs to
+            config: Config object
+        """
         self.config = config
+        self.sequence_length = config.sequence_length
         
-        # Handle inf values in elevation maps
+        # Handle inf values
         if config.handle_inf_elevation:
             states = self._handle_inf(states.copy())
             next_states = self._handle_inf(next_states.copy())
         
-        # Compute state deltas
+        # Compute deltas if needed
         if config.predict_delta:
-            self.targets = next_states - states  # Predict change
+            self.targets = next_states - states
         else:
-            self.targets = next_states  # Predict absolute next state
+            self.targets = next_states
         
-        self.states = states
-        self.actions = actions
+        # Create sequences
+        print(f"  Creating sequences of length {self.sequence_length}...")
+        self.sequences = self._create_sequences(states, actions, self.targets, episode_ids)
         
-        # Compute normalization statistics
+        print(f"  Created {len(self.sequences)} sequences from {len(states)} transitions")
+        
+        # Compute normalization from all data (not sequences)
         self.state_mean = states.mean(axis=0)
         self.state_std = states.std(axis=0) + 1e-8
-        
         self.action_mean = actions.mean(axis=0)
         self.action_std = actions.std(axis=0) + 1e-8
-        
         self.target_mean = self.targets.mean(axis=0)
         self.target_std = self.targets.std(axis=0) + 1e-8
-        
-        # print(f"Dataset size: {len(states):,} transitions")
-        # print(f"State dim: {states.shape[1]}")
-        # print(f"Action dim: {actions.shape[1]}")
-        # print(f"Predicting: {'state deltas' if config.predict_delta else 'next states'}")
     
-    """
-    Replace inf values with a large negative sentinel.
-    """
     def _handle_inf(self, data):
+        """Replace inf values with sentinel."""
         elevation_size = self.config.elevation_map_size
         elevation_maps = data[:, -elevation_size:]
-        
         inf_mask = np.isinf(elevation_maps)
         if inf_mask.any():
-            print(f"  Replacing {inf_mask.sum():,} inf values in elevation maps")
             elevation_maps[inf_mask] = -10.0
             data[:, -elevation_size:] = elevation_maps
-        
         return data
     
+    def _create_sequences(self, states, actions, targets, episode_ids):
+        """Create sequences that don't cross episode boundaries."""
+        sequences = []
+        
+        # Group by episode
+        unique_episodes = np.unique(episode_ids)
+        
+        for ep_id in unique_episodes:
+            # Get all transitions in this episode
+            ep_mask = (episode_ids == ep_id)
+            ep_states = states[ep_mask]
+            ep_actions = actions[ep_mask]
+            ep_targets = targets[ep_mask]
+            
+            # Create sequences within this episode
+            ep_len = len(ep_states)
+            if ep_len < self.sequence_length:
+                continue  # Skip episodes too short
+            
+            # Sliding window
+            for i in range(ep_len - self.sequence_length):
+                seq_states = ep_states[i:i+self.sequence_length]
+                seq_actions = ep_actions[i:i+self.sequence_length]
+                target = ep_targets[i+self.sequence_length-1]  # Predict last target
+                
+                sequences.append({
+                    'states': seq_states,    # (seq_len, state_dim)
+                    'actions': seq_actions,  # (seq_len, action_dim)
+                    'target': target         # (state_dim,)
+                })
+        
+        return sequences
+    
     def __len__(self):
-        return len(self.states)
+        return len(self.sequences)
     
     def __getitem__(self, idx):
-        state = self.states[idx]
-        action = self.actions[idx]
-        target = self.targets[idx]
+        seq = self.sequences[idx]
+        
+        states = seq['states']
+        actions = seq['actions']
+        target = seq['target']
         
         # Normalize
         if self.config.normalize_states:
-            state = (state - self.state_mean) / self.state_std
+            states = (states - self.state_mean) / self.state_std
             target = (target - self.target_mean) / self.target_std
         
         if self.config.normalize_actions:
-            action = (action - self.action_mean) / self.action_std
+            actions = (actions - self.action_mean) / self.action_std
         
         return (
-            torch.FloatTensor(state),
-            torch.FloatTensor(action),
-            torch.FloatTensor(target)
+            torch.FloatTensor(states),   # (seq_len, state_dim)
+            torch.FloatTensor(actions),  # (seq_len, action_dim)
+            torch.FloatTensor(target)    # (state_dim,)
         )
 
 
-"""
-MLP model for dynamics prediction.
-"""
-class DynamicsMLP(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dims, dropout=0.1):
+# ============================================================================
+# MODEL (LSTM)
+# ============================================================================
+
+class DynamicsLSTM(nn.Module):
+    """LSTM model for dynamics prediction from sequences."""
+    
+    def __init__(self, state_dim, action_dim, hidden_size, num_layers, dropout=0.2):
         super().__init__()
         
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        # Concatenate state and action at each timestep
         input_dim = state_dim + action_dim
-        output_dim = state_dim
         
-        layers = []
-        prev_dim = input_dim
+        # LSTM processes sequence
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0,
+            batch_first=True  # (batch, seq, features)
+        )
         
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout)
-            ])
-            prev_dim = hidden_dim
-        
-        layers.append(nn.Linear(prev_dim, output_dim))
-        
-        self.network = nn.Sequential(*layers)
+        # Final prediction layers
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, state_dim)
+        )
         
         print(f"\nModel Architecture:")
-        print(f"  Input: {input_dim} (state + action)")
-        print(f"  Hidden layers: {hidden_dims}")
-        print(f"  Output: {output_dim} (state)")
+        print(f"  Input per timestep: {input_dim} (state + action)")
+        print(f"  LSTM: {num_layers} layers, {hidden_size} hidden size")
+        print(f"  Output: {state_dim} (state or delta)")
         total_params = sum(p.numel() for p in self.parameters())
         print(f"  Total parameters: {total_params:,}")
     
-    """
-    Args:
-        state: (batch, state_dim)
-        action: (batch, action_dim)
-    Returns:
-        predicted_next_state or predicted_delta: (batch, state_dim)
-    """
-    def forward(self, state, action):
-        x = torch.cat([state, action], dim=-1)
-        return self.network(x)
+    def forward(self, states, actions):
+        """
+        Args:
+            states: (batch, seq_len, state_dim)
+            actions: (batch, seq_len, action_dim)
+        Returns:
+            predictions: (batch, state_dim)
+        """
+        batch_size, seq_len, _ = states.shape
+        
+        # Concatenate state and action at each timestep
+        x = torch.cat([states, actions], dim=-1)  # (batch, seq_len, state_dim+action_dim)
+        
+        # Process sequence with LSTM
+        lstm_out, (h_n, c_n) = self.lstm(x)  # lstm_out: (batch, seq_len, hidden_size)
+        
+        # Use final hidden state for prediction
+        final_hidden = lstm_out[:, -1, :]  # (batch, hidden_size)
+        
+        # Predict delta or next state
+        prediction = self.fc(final_hidden)  # (batch, state_dim)
+        
+        return prediction
 
 
-"""
-MLP Training.
-"""
+# ============================================================================
+# TRAINING FUNCTIONS
+# ============================================================================
+
 def train_epoch(model, loader, optimizer, criterion, device):
+    """Train for one epoch."""
     model.train()
     total_loss = 0
     
@@ -186,19 +246,21 @@ def train_epoch(model, loader, optimizer, criterion, device):
         predictions = model(states, actions)
         loss = criterion(predictions, targets)
         loss.backward()
+        
+        # Gradient clipping (important for RNNs)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
         
         total_loss += loss.item() * len(states)
     
     return total_loss / len(loader.dataset)
 
-"""
-Evaluate on validation set.
-"""
+
 def eval_epoch(model, loader, criterion, device, dataset):
+    """Evaluate on validation set."""
     model.eval()
     total_loss = 0
-    
     errors = []
     
     with torch.no_grad():
@@ -211,6 +273,7 @@ def eval_epoch(model, loader, criterion, device, dataset):
             loss = criterion(predictions, targets)
             total_loss += loss.item() * len(states)
             
+            # Denormalize for interpretable errors
             pred_denorm = predictions.cpu().numpy() * dataset.target_std + dataset.target_mean
             target_denorm = targets.cpu().numpy() * dataset.target_std + dataset.target_mean
             
@@ -223,6 +286,7 @@ def eval_epoch(model, loader, criterion, device, dataset):
 
 
 def compute_component_errors(errors, state_dim, elevation_map_size):
+    """Compute errors for different state components."""
     core_dim = state_dim - elevation_map_size
     core_errors = errors[:, :core_dim]
     elevation_errors = errors[:, core_dim:]
@@ -247,29 +311,37 @@ def compute_component_errors(errors, state_dim, elevation_map_size):
     return results
 
 
-"""
-Main client to run MLP.
-"""
+# ============================================================================
+# MAIN
+# ============================================================================
+
 def main(args):
     config = Config()
     
+    # Override config with args if provided
     if args.data_file:
         config.data_file = args.data_file
     if args.epochs:
         config.num_epochs = args.epochs
     if args.batch_size:
         config.batch_size = args.batch_size
+    if args.sequence_length:
+        config.sequence_length = args.sequence_length
     
-    print("MLP Baseline Dynamics Model Training")
+    print("=" * 80)
+    print("RNN/LSTM DYNAMICS MODEL TRAINING")
     print("=" * 80)
     
+    # Create output directory
     config.save_dir.mkdir(parents=True, exist_ok=True)
     
+    # Load data
     print("\nLoading data...")
     with h5py.File(config.data_file, 'r') as f:
         states = f['states'][:]
         actions = f['actions'][:]
         next_states = f['next_states'][:]
+        episode_ids = f['episode_ids'][:]
         terminated = f['terminated'][:]
         truncated = f['truncated'][:]
         
@@ -280,42 +352,50 @@ def main(args):
         print(f"State dim: {state_dim}")
         print(f"Action dim: {action_dim}")
     
-    # Filter out episode boundary transitions
+    # Filter out episode boundaries
+    print("\n⚠️  Filtering out episode boundaries (resets)...")
     valid_mask = ~(terminated | truncated)
     
-    # Only keep valid transitions
+    print(f"  Before filtering: {len(states):,} transitions")
+    print(f"  After filtering:  {valid_mask.sum():,} transitions ({100*valid_mask.sum()/len(states):.1f}%)")
+    
     states = states[valid_mask]
     actions = actions[valid_mask]
     next_states = next_states[valid_mask]
+    episode_ids = episode_ids[valid_mask]
     
-    # Verify filtering worked
-    pos_delta = next_states[:, :3] - states[:, :3]
+    # Split by episode (important for sequences!)
+    unique_episodes = np.unique(episode_ids)
+    n_episodes = len(unique_episodes)
+    n_train_eps = int(n_episodes * (1 - config.val_split))
     
-    if np.abs(pos_delta).max() > 5.0:
-        print("\nWarning: there might be issues with transition data.")
+    # Shuffle episodes
+    np.random.shuffle(unique_episodes)
+    train_episodes = set(unique_episodes[:n_train_eps])
+    val_episodes = set(unique_episodes[n_train_eps:])
     
-    # Split data
-    n_samples = len(states)
-    n_train = int(n_samples * (1 - config.val_split))
+    train_mask = np.array([ep in train_episodes for ep in episode_ids])
+    val_mask = np.array([ep in val_episodes for ep in episode_ids])
     
-    # Shuffle indices
-    indices = np.random.permutation(n_samples)
-    train_idx = indices[:n_train]
-    val_idx = indices[n_train:]
+    print(f"\nData split (by episode):")
+    print(f"  Train: {n_train_eps} episodes ({train_mask.sum():,} transitions)")
+    print(f"  Val:   {n_episodes - n_train_eps} episodes ({val_mask.sum():,} transitions)")
     
     # Create datasets
-    print("\nCreating datasets...")
-    train_dataset = DynamicsDataset(
-        states[train_idx],
-        actions[train_idx],
-        next_states[train_idx],
+    print("\nCreating sequence datasets...")
+    train_dataset = SequenceDynamicsDataset(
+        states[train_mask],
+        actions[train_mask],
+        next_states[train_mask],
+        episode_ids[train_mask],
         config
     )
     
-    val_dataset = DynamicsDataset(
-        states[val_idx],
-        actions[val_idx],
-        next_states[val_idx],
+    val_dataset = SequenceDynamicsDataset(
+        states[val_mask],
+        actions[val_mask],
+        next_states[val_mask],
+        episode_ids[val_mask],
         config
     )
     
@@ -328,7 +408,7 @@ def main(args):
     val_dataset.target_std = train_dataset.target_std
     
     # Create dataloaders
-    use_pin_memory = config.device == 'cuda'  # pin memory for CUDA
+    use_pin_memory = config.device == 'cuda'
     
     train_loader = DataLoader(
         train_dataset,
@@ -348,10 +428,11 @@ def main(args):
     
     # Create model
     print("\nInitializing model...")
-    model = DynamicsMLP(
+    model = DynamicsLSTM(
         state_dim=state_dim,
         action_dim=action_dim,
-        hidden_dims=config.hidden_dims,
+        hidden_size=config.hidden_size,
+        num_layers=config.num_layers,
         dropout=config.dropout
     ).to(config.device)
     
@@ -374,6 +455,7 @@ def main(args):
     
     # Training loop
     print(f"\nTraining on {config.device}...")
+    print(f"Sequence length: {config.sequence_length} steps (0.{config.sequence_length}s history)")
     print("=" * 80)
     
     train_losses = []
@@ -418,8 +500,10 @@ def main(args):
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'config': {
-                    'hidden_dims': config.hidden_dims,
+                    'hidden_size': config.hidden_size,
+                    'num_layers': config.num_layers,
                     'dropout': config.dropout,
+                    'sequence_length': config.sequence_length,
                     'elevation_map_size': config.elevation_map_size,
                     'predict_delta': config.predict_delta,
                 },
@@ -443,6 +527,7 @@ def main(args):
             }, config.save_dir / f'checkpoint_epoch_{epoch+1}.pt')
     
     print("\n" + "=" * 80)
+    print("Training complete!")
     print(f"Best validation loss: {best_val_loss:.6f}")
     
     # Plot training curves
@@ -452,15 +537,16 @@ def main(args):
     ax.plot(val_losses, label='Val Loss', linewidth=2)
     ax.set_xlabel('Epoch')
     ax.set_ylabel('MSE Loss')
-    ax.set_title('Training Progress')
+    ax.set_title(f'RNN Training Progress (seq_len={config.sequence_length})')
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(config.save_dir / 'training_curves.png', dpi=150)
     print(f"Saved: {config.save_dir / 'training_curves.png'}")
     
-    # Final evaluation with component breakdown
-    print("\nFinal Evaluation")
+    # Final evaluation
+    print("\n" + "=" * 80)
+    print("FINAL EVALUATION")
     print("=" * 80)
     
     model.load_state_dict(torch.load(config.save_dir / 'best_model.pt', weights_only=False)['model_state_dict'])
@@ -488,13 +574,29 @@ def main(args):
     print(f"  RMSE: {final_comp_errors['elevation']['rmse']:.4f}m")
     
     print(f"\nModel saved to: {config.save_dir}")
+    
+    # Comparison with MLP
+    print("\n" + "=" * 80)
+    print("COMPARISON")
+    print("=" * 80)
+    print("\nTo compare with MLP baseline, check if RNN improves position MAE.")
+    print("MLP baseline: ~0.017m (1.7cm)")
+    print(f"RNN result:   {final_comp_errors['position']['mae'].mean():.4f}m "
+          f"({final_comp_errors['position']['mae'].mean()*100:.2f}cm)")
+    
+    improvement = (1 - final_comp_errors['position']['mae'].mean() / 0.017) * 100
+    if improvement > 0:
+        print(f"\n✓ RNN improved by {improvement:.1f}%! Temporal patterns matter.")
+    else:
+        print(f"\n→ RNN similar performance. Dynamics may be Markovian (current state sufficient).")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train baseline dynamics model")
+    parser = argparse.ArgumentParser(description="Train RNN/LSTM dynamics model")
     parser.add_argument('--data_file', type=str, help='Path to H5 data file')
     parser.add_argument('--epochs', type=int, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, help='Batch size')
+    parser.add_argument('--sequence_length', type=int, help='Length of input sequences (default: 5)')
     args = parser.parse_args()
     
     main(args)
