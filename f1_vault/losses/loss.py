@@ -297,9 +297,24 @@ class PhysicsInformedTerrainLoss(nn.Module):
             logs["loss/traj_pos"] = float(traj_pos_loss.detach().cpu())
             logs["loss/traj_yaw"] = float(traj_yaw_loss.detach().cpu())
 
+            # with torch.no_grad():
+            #     rmse = torch.sqrt(((pred_pos - gt_pos) ** 2).mean()).item()
+            #     logs["metric/pos_rmse"] = float(rmse)
             with torch.no_grad():
-                rmse = torch.sqrt(((pred_pos - gt_pos) ** 2).mean()).item()
+                err = pred_pos - gt_pos
+                err_xy = pred_pos[..., 0:2] - gt_pos[..., 0:2]
+
+                rmse = torch.sqrt((err ** 2).mean()).item()
+                rmse_x = torch.sqrt((err[..., 0] ** 2).mean()).item()
+                rmse_y = torch.sqrt((err[..., 1] ** 2).mean()).item()
+                rmse_z = torch.sqrt((err[..., 2] ** 2).mean()).item()
+                rmse_xy = torch.sqrt((err_xy ** 2).mean()).item()
+
                 logs["metric/pos_rmse"] = float(rmse)
+                logs["metric/rmse_x"] = float(rmse_x)
+                logs["metric/rmse_y"] = float(rmse_y)
+                logs["metric/rmse_z"] = float(rmse_z)
+                logs["metric/rmse_xy"] = float(rmse_xy)
 
         logs["loss/total"] = float(total.detach().cpu())
         return total, logs
