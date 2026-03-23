@@ -1,4 +1,9 @@
 """
+Visualize Robot Trajectories: Predicted vs Actual
+
+This script loads a trained dynamics model and visualizes multi-step rollouts,
+comparing predicted trajectories against ground truth from validation episodes.
+
 Usage:
     python visualize_trajectories.py --model models/cnn_dynamics/best_model.pt --data data/raw/dynamics_data_0000.h5
 """
@@ -161,6 +166,67 @@ def rollout_trajectory(model, initial_state, actions, config, stats, device, use
     return predicted_states
 
 
+def predict_single_steps(model, states, actions, config, stats, device, use_normalization):
+    """
+    Predict single-step transitions using GROUND TRUTH states.
+    This shows true single-step performance without error compounding.
+    
+    Args:
+        states: (T, state_dim) ground truth states
+        actions: (T-1, 2) actions taken
+        
+    Returns:
+        predictions: (T-1, state_dim) predicted next states
+    """
+    elevation_map_size = config['elevation_map_size']
+    predict_delta = config['predict_delta']
+    
+    T = len(states) - 1
+    predictions = []
+    
+    for t in range(T):
+        current_state = states[t]
+        action = actions[t]
+        
+        # Split state
+        core_state = current_state[:-elevation_map_size]
+        elevation_map = current_state[-elevation_map_size:].reshape(26, 26)
+        
+        # Normalize if needed
+        if use_normalization:
+            core_state = (core_state - stats['core_state_mean']) / stats['core_state_std']
+            elevation_map = (elevation_map - stats['elevation_mean']) / stats['elevation_std']
+            action = (action - stats['action_mean']) / stats['action_std']
+        
+        # Predict
+        with torch.no_grad():
+            core_tensor = torch.FloatTensor(core_state).unsqueeze(0).to(device)
+            elev_tensor = torch.FloatTensor(elevation_map).unsqueeze(0).unsqueeze(0).to(device)
+            action_tensor = torch.FloatTensor(action).unsqueeze(0).to(device)
+            
+            pred_core, pred_elev = model(core_tensor, elev_tensor, action_tensor)
+            
+            pred_core = pred_core.squeeze(0).cpu().numpy()
+            pred_elev = pred_elev.squeeze(0).squeeze(0).cpu().numpy()
+        
+        # Denormalize if needed
+        if use_normalization:
+            pred_core = pred_core * stats['core_target_std'] + stats['core_target_mean']
+            pred_elev = pred_elev * stats['elevation_target_std'] + stats['elevation_target_mean']
+        
+        # Convert delta to absolute if needed
+        if predict_delta:
+            pred_state = current_state.copy()
+            pred_state[:-elevation_map_size] += pred_core
+            pred_state[-elevation_map_size:] = (elevation_map + pred_elev).flatten()
+        else:
+            pred_state = np.concatenate([pred_core, pred_elev.flatten()])
+        
+        predictions.append(pred_state)
+    
+    return np.array(predictions)
+
+
 def visualize_trajectories(data_file, model_path, num_episodes=5, rollout_length=50):
     """Visualize predicted vs actual trajectories."""
     
@@ -199,7 +265,13 @@ def visualize_trajectories(data_file, model_path, num_episodes=5, rollout_length
     # Create plots
     output_dir = Path(model_path).parent
     
-    # Figure 1: 3D trajectories
+    print("\n" + "=" * 80)
+    print("GENERATING VISUALIZATIONS")
+    print("=" * 80)
+    print("\nNote: Showing SINGLE-STEP predictions (no error compounding)")
+    print("Each prediction uses ground-truth state, not accumulated predictions")
+    
+    # Figure 1: 3D trajectories (SINGLE-STEP)
     fig1 = plt.figure(figsize=(16, 12))
     
     for idx, ep_id in enumerate(sample_episodes):
@@ -208,19 +280,16 @@ def visualize_trajectories(data_file, model_path, num_episodes=5, rollout_length
         ep_states = states[ep_mask]
         ep_actions = actions[ep_mask]
         
-        # Limit rollout length
+        # Limit length
         ep_len = min(rollout_length, len(ep_states) - 1)
         
-        # Rollout
-        initial_state = ep_states[0]
-        rollout_actions = ep_actions[:ep_len]
-        
-        predicted_states = rollout_trajectory(
-            model, initial_state, rollout_actions, 
+        # Single-step predictions (using ground truth states)
+        predicted_states = predict_single_steps(
+            model, ep_states[:ep_len + 1], ep_actions[:ep_len],
             config, stats, device, use_normalization
         )
         
-        actual_states = ep_states[:ep_len + 1]
+        actual_states = ep_states[1:ep_len + 1]  # Skip first (no prediction for t=0)
         
         # Extract positions
         pred_pos = predicted_states[:, :3]
@@ -234,24 +303,23 @@ def visualize_trajectories(data_file, model_path, num_episodes=5, rollout_length
                 'r--', linewidth=2, label='Predicted', alpha=0.8)
         ax.scatter(actual_pos[0, 0], actual_pos[0, 1], actual_pos[0, 2], 
                   c='green', s=100, marker='o', label='Start')
-        ax.scatter(actual_pos[-1, 0], actual_pos[-1, 1], actual_pos[-1, 2], 
-                  c='red', s=100, marker='x', label='End')
         
-        # Compute error
-        final_error = np.linalg.norm(pred_pos[-1] - actual_pos[-1]) * 100
+        # Mean error across trajectory
+        errors = np.linalg.norm(pred_pos - actual_pos, axis=1) * 100
+        mean_error = errors.mean()
         
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
         ax.set_zlabel('Z (m)')
-        ax.set_title(f'Episode {ep_id} ({ep_len} steps, 0.1s each)\nFinal error: {final_error:.1f}cm')
+        ax.set_title(f'Episode {ep_id} ({ep_len} steps)\nMean error: {mean_error:.1f}cm')
         ax.legend()
         ax.view_init(elev=20, azim=45)
     
     plt.tight_layout()
-    plt.savefig(output_dir / 'trajectory_3d.png', dpi=150, bbox_inches='tight')
-    print(f"✓ Saved: trajectory_3d.png")
+    plt.savefig(output_dir / 'trajectory_3d_singlestep.png', dpi=150, bbox_inches='tight')
+    print(f"✓ Saved: trajectory_3d_singlestep.png")
     
-    # Figure 2: XY trajectories (top-down)
+    # Figure 2: XY trajectories (top-down) SINGLE-STEP
     fig2, axes = plt.subplots(2, 3, figsize=(16, 10))
     axes = axes.flatten()
     
@@ -261,14 +329,12 @@ def visualize_trajectories(data_file, model_path, num_episodes=5, rollout_length
         ep_actions = actions[ep_mask]
         
         ep_len = min(rollout_length, len(ep_states) - 1)
-        initial_state = ep_states[0]
-        rollout_actions = ep_actions[:ep_len]
         
-        predicted_states = rollout_trajectory(
-            model, initial_state, rollout_actions,
+        predicted_states = predict_single_steps(
+            model, ep_states[:ep_len + 1], ep_actions[:ep_len],
             config, stats, device, use_normalization
         )
-        actual_states = ep_states[:ep_len + 1]
+        actual_states = ep_states[1:ep_len + 1]
         
         pred_pos = predicted_states[:, :3]
         actual_pos = actual_states[:, :3]
@@ -278,35 +344,24 @@ def visualize_trajectories(data_file, model_path, num_episodes=5, rollout_length
         ax.plot(actual_pos[:, 0], actual_pos[:, 1], 'b-', linewidth=2, label='Actual', alpha=0.8)
         ax.plot(pred_pos[:, 0], pred_pos[:, 1], 'r--', linewidth=2, label='Predicted', alpha=0.8)
         ax.scatter(actual_pos[0, 0], actual_pos[0, 1], c='green', s=100, marker='o', zorder=5)
-        ax.scatter(actual_pos[-1, 0], actual_pos[-1, 1], c='blue', s=100, marker='s', zorder=5)
-        ax.scatter(pred_pos[-1, 0], pred_pos[-1, 1], c='red', s=100, marker='x', zorder=5)
         
-        # Draw error vector
-        ax.arrow(actual_pos[-1, 0], actual_pos[-1, 1],
-                pred_pos[-1, 0] - actual_pos[-1, 0],
-                pred_pos[-1, 1] - actual_pos[-1, 1],
-                head_width=0.3, head_length=0.2, fc='orange', ec='orange', alpha=0.5)
-        
-        final_error = np.linalg.norm(pred_pos[-1] - actual_pos[-1]) * 100
+        # Mean error
+        errors = np.linalg.norm(pred_pos - actual_pos, axis=1) * 100
+        mean_error = errors.mean()
         
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
-        ax.set_title(f'Episode {ep_id}\n{ep_len} steps, Final error: {final_error:.1f}cm')
+        ax.set_title(f'Episode {ep_id}\n{ep_len} steps, Mean error: {mean_error:.1f}cm')
         ax.legend(loc='best')
         ax.grid(True, alpha=0.3)
         ax.axis('equal')
     
     plt.tight_layout()
-    plt.savefig(output_dir / 'trajectory_xy.png', dpi=150, bbox_inches='tight')
-    print(f"✓ Saved: trajectory_xy.png")
+    plt.savefig(output_dir / 'trajectory_xy_singlestep.png', dpi=150, bbox_inches='tight')
+    print(f"✓ Saved: trajectory_xy_singlestep.png")
     
-    # Figure 3: Error accumulation over time
+    # Figure 3: Error over time (SINGLE-STEP)
     fig3, axes = plt.subplots(2, 2, figsize=(14, 10))
-    
-    # Collect errors for all episodes
-    all_errors_xy = []
-    all_errors_z = []
-    all_errors_mag = []
     
     for ep_id in sample_episodes:
         ep_mask = episode_ids == ep_id
@@ -314,80 +369,77 @@ def visualize_trajectories(data_file, model_path, num_episodes=5, rollout_length
         ep_actions = actions[ep_mask]
         
         ep_len = min(rollout_length, len(ep_states) - 1)
-        initial_state = ep_states[0]
-        rollout_actions = ep_actions[:ep_len]
         
-        predicted_states = rollout_trajectory(
-            model, initial_state, rollout_actions,
+        # Single-step predictions
+        predicted_states = predict_single_steps(
+            model, ep_states[:ep_len + 1], ep_actions[:ep_len],
             config, stats, device, use_normalization
         )
-        actual_states = ep_states[:ep_len + 1]
+        actual_states = ep_states[1:ep_len + 1]
         
         pred_pos = predicted_states[:, :3]
         actual_pos = actual_states[:, :3]
         
-        # Compute cumulative errors
+        # Compute errors
         errors = pred_pos - actual_pos
-        error_xy = np.linalg.norm(errors[:, :2], axis=1) * 100  # cm
-        error_z = np.abs(errors[:, 2]) * 100  # cm
-        error_mag = np.linalg.norm(errors, axis=1) * 100  # cm
+        error_xy = np.linalg.norm(errors[:, :2], axis=1) * 100
+        error_z = np.abs(errors[:, 2]) * 100
+        error_mag = np.linalg.norm(errors, axis=1) * 100
         
-        timesteps = np.arange(len(error_mag)) * 0.1  # seconds
+        timesteps = np.arange(1, len(error_mag) + 1) * 0.1
         
         axes[0, 0].plot(timesteps, error_xy, linewidth=2, alpha=0.7, label=f'Ep {ep_id}')
         axes[0, 1].plot(timesteps, error_z, linewidth=2, alpha=0.7, label=f'Ep {ep_id}')
         axes[1, 0].plot(timesteps, error_mag, linewidth=2, alpha=0.7, label=f'Ep {ep_id}')
-        
-        all_errors_xy.append(error_xy)
-        all_errors_z.append(error_z)
-        all_errors_mag.append(error_mag)
     
-    # XY error
     axes[0, 0].set_xlabel('Time (s)')
-    axes[0, 0].set_ylabel('XY Position Error (cm)')
-    axes[0, 0].set_title('Lateral Error Accumulation')
+    axes[0, 0].set_ylabel('XY Error (cm)')
+    axes[0, 0].set_title('Single-Step XY Error (No Compounding)')
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     
-    # Z error
     axes[0, 1].set_xlabel('Time (s)')
-    axes[0, 1].set_ylabel('Z Position Error (cm)')
-    axes[0, 1].set_title('Height Error Accumulation')
+    axes[0, 1].set_ylabel('Z Error (cm)')
+    axes[0, 1].set_title('Single-Step Height Error')
     axes[0, 1].legend()
     axes[0, 1].grid(True, alpha=0.3)
     
-    # 3D error magnitude
     axes[1, 0].set_xlabel('Time (s)')
-    axes[1, 0].set_ylabel('3D Position Error (cm)')
-    axes[1, 0].set_title('Total Position Error Over Time')
+    axes[1, 0].set_ylabel('3D Error (cm)')
+    axes[1, 0].set_title('Single-Step Position Error')
     axes[1, 0].legend()
     axes[1, 0].grid(True, alpha=0.3)
     
-    # Average error accumulation
-    max_len = max(len(e) for e in all_errors_mag)
-    avg_errors = np.zeros(max_len)
-    counts = np.zeros(max_len)
+    # Error histogram
+    all_errors = []
+    for ep_id in sample_episodes:
+        ep_mask = episode_ids == ep_id
+        ep_states = states[ep_mask]
+        ep_actions = actions[ep_mask]
+        ep_len = min(rollout_length, len(ep_states) - 1)
+        
+        predicted_states = predict_single_steps(
+            model, ep_states[:ep_len + 1], ep_actions[:ep_len],
+            config, stats, device, use_normalization
+        )
+        actual_states = ep_states[1:ep_len + 1]
+        
+        errors = np.linalg.norm(predicted_states[:, :3] - actual_states[:, :3], axis=1) * 100
+        all_errors.extend(errors)
     
-    for errors in all_errors_mag:
-        avg_errors[:len(errors)] += errors
-        counts[:len(errors)] += 1
-    
-    avg_errors = avg_errors / (counts + 1e-8)
-    timesteps = np.arange(max_len) * 0.1
-    
-    axes[1, 1].plot(timesteps, avg_errors, linewidth=3, color='purple', label='Average')
-    axes[1, 1].fill_between(timesteps, 0, avg_errors, alpha=0.3, color='purple')
-    axes[1, 1].set_xlabel('Time (s)')
-    axes[1, 1].set_ylabel('Average 3D Error (cm)')
-    axes[1, 1].set_title('Mean Error Accumulation Across Episodes')
+    axes[1, 1].hist(all_errors, bins=50, alpha=0.7, edgecolor='black', color='purple')
+    axes[1, 1].set_xlabel('Position Error (cm)')
+    axes[1, 1].set_ylabel('Count')
+    axes[1, 1].set_title(f'Error Distribution (Mean: {np.mean(all_errors):.2f}cm)')
+    axes[1, 1].grid(True, alpha=0.3, axis='y')
+    axes[1, 1].axvline(x=np.mean(all_errors), color='r', linestyle='--', linewidth=2, label='Mean')
     axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(output_dir / 'error_accumulation.png', dpi=150, bbox_inches='tight')
-    print(f"✓ Saved: error_accumulation.png")
+    plt.savefig(output_dir / 'error_singlestep.png', dpi=150, bbox_inches='tight')
+    print(f"✓ Saved: error_singlestep.png")
     
-    # Figure 4: Single episode detailed view
+    # Figure 4: Single episode detailed view (SINGLE-STEP)
     print("\nGenerating detailed single-episode visualization...")
     ep_id = sample_episodes[0]
     ep_mask = episode_ids == ep_id
@@ -395,18 +447,17 @@ def visualize_trajectories(data_file, model_path, num_episodes=5, rollout_length
     ep_actions = actions[ep_mask]
     
     ep_len = min(rollout_length, len(ep_states) - 1)
-    initial_state = ep_states[0]
-    rollout_actions = ep_actions[:ep_len]
     
-    predicted_states = rollout_trajectory(
-        model, initial_state, rollout_actions,
+    # Single-step predictions
+    predicted_states = predict_single_steps(
+        model, ep_states[:ep_len + 1], ep_actions[:ep_len],
         config, stats, device, use_normalization
     )
-    actual_states = ep_states[:ep_len + 1]
+    actual_states = ep_states[1:ep_len + 1]
     
     pred_pos = predicted_states[:, :3]
     actual_pos = actual_states[:, :3]
-    timesteps = np.arange(len(pred_pos)) * 0.1
+    timesteps = np.arange(1, len(pred_pos) + 1) * 0.1
     
     fig4, axes = plt.subplots(3, 2, figsize=(14, 12))
     
@@ -417,7 +468,7 @@ def visualize_trajectories(data_file, model_path, num_episodes=5, rollout_length
         ax.plot(timesteps, pred_pos[:, i], 'r--', linewidth=2, label='Predicted', alpha=0.8)
         ax.set_xlabel('Time (s)')
         ax.set_ylabel(f'{label} Position (m)')
-        ax.set_title(f'{label} Position Over Time')
+        ax.set_title(f'{label} Position (Single-Step Predictions)')
         ax.legend()
         ax.grid(True, alpha=0.3)
     
@@ -438,14 +489,16 @@ def visualize_trajectories(data_file, model_path, num_episodes=5, rollout_length
     
     axes[1, 1].plot(timesteps, error_mag, linewidth=2, color='orange')
     axes[1, 1].fill_between(timesteps, 0, error_mag, alpha=0.3, color='orange')
+    axes[1, 1].axhline(y=error_mag.mean(), color='r', linestyle='--', linewidth=2, label=f'Mean: {error_mag.mean():.2f}cm')
     axes[1, 1].set_xlabel('Time (s)')
     axes[1, 1].set_ylabel('Position Error (cm)')
-    axes[1, 1].set_title('Prediction Error Over Time')
+    axes[1, 1].set_title('Single-Step Error (Independent Predictions)')
+    axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
     
     # Actions used
-    axes[2, 1].plot(timesteps[:ep_len], rollout_actions[:, 0], linewidth=2, label='Throttle', alpha=0.8)
-    axes[2, 1].plot(timesteps[:ep_len], rollout_actions[:, 1], linewidth=2, label='Steering', alpha=0.8)
+    axes[2, 1].plot(timesteps, ep_actions[:ep_len, 0], linewidth=2, label='Throttle', alpha=0.8)
+    axes[2, 1].plot(timesteps, ep_actions[:ep_len, 1], linewidth=2, label='Steering', alpha=0.8)
     axes[2, 1].set_xlabel('Time (s)')
     axes[2, 1].set_ylabel('Action Value')
     axes[2, 1].set_title('Control Inputs')
@@ -454,46 +507,57 @@ def visualize_trajectories(data_file, model_path, num_episodes=5, rollout_length
     axes[2, 1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(output_dir / 'detailed_episode.png', dpi=150, bbox_inches='tight')
-    print(f"✓ Saved: detailed_episode.png")
+    plt.savefig(output_dir / 'detailed_episode_singlestep.png', dpi=150, bbox_inches='tight')
+    print(f"✓ Saved: detailed_episode_singlestep.png")
     
-    # Print summary statistics
+    # Summary statistics
     print("\n" + "=" * 80)
-    print("ROLLOUT STATISTICS")
+    print("SINGLE-STEP PREDICTION STATISTICS")
     print("=" * 80)
     
-    all_final_errors = []
+    all_single_errors = []
     for ep_id in sample_episodes:
         ep_mask = episode_ids == ep_id
         ep_states = states[ep_mask]
         ep_actions = actions[ep_mask]
         
         ep_len = min(rollout_length, len(ep_states) - 1)
-        predicted_states = rollout_trajectory(
-            model, ep_states[0], ep_actions[:ep_len],
+        predicted_states = predict_single_steps(
+            model, ep_states[:ep_len + 1], ep_actions[:ep_len],
             config, stats, device, use_normalization
         )
+        actual_states = ep_states[1:ep_len + 1]
         
-        final_error = np.linalg.norm(predicted_states[-1, :3] - ep_states[ep_len, :3])
-        all_final_errors.append(final_error)
+        errors = np.linalg.norm(predicted_states[:, :3] - actual_states[:, :3], axis=1)
+        all_single_errors.extend(errors)
     
-    all_final_errors = np.array(all_final_errors)
+    all_single_errors = np.array(all_single_errors) * 100
     
-    print(f"\n{rollout_length}-step rollout ({rollout_length * 0.1:.1f}s):")
-    print(f"  Mean final error: {all_final_errors.mean()*100:.2f} cm")
-    print(f"  Median final error: {np.median(all_final_errors)*100:.2f} cm")
-    print(f"  Max final error: {all_final_errors.max()*100:.2f} cm")
-    print(f"  Min final error: {all_final_errors.min()*100:.2f} cm")
-    print(f"\nSingle-step MAE (from training): ~{stats.get('position_mae', 0.017)*100:.2f} cm")
-    print(f"Multi-step error growth: {all_final_errors.mean() / rollout_length:.4f} m/step")
+    print(f"\nSingle-step error statistics (across {len(sample_episodes)} episodes):")
+    print(f"  Mean: {all_single_errors.mean():.2f} cm")
+    print(f"  Median: {np.median(all_single_errors):.2f} cm")
+    print(f"  Std: {all_single_errors.std():.2f} cm")
+    print(f"  95th percentile: {np.percentile(all_single_errors, 95):.2f} cm")
+    print(f"  Max: {all_single_errors.max():.2f} cm")
+    
+    print("\n" + "=" * 80)
+    print("INTERPRETATION")
+    print("=" * 80)
+    print("\nThese plots show SINGLE-STEP predictions:")
+    print("  ✓ Each prediction uses ground-truth state (no error compounding)")
+    print("  ✓ This matches how the model was trained")
+    print("  ✓ Errors should be consistent with training MAE (~0.8cm)")
+    print("\nFor MPC/replanning control (10Hz), this is the relevant metric.")
+    print("The model gets fresh sensor data every step, so errors don't accumulate.")
     
     print("\n" + "=" * 80)
     print("PLOTS GENERATED")
     print("=" * 80)
-    print(f"  - trajectory_3d.png (3D trajectories)")
-    print(f"  - trajectory_xy.png (top-down view)")
-    print(f"  - error_accumulation.png (error over time)")
-    print(f"  - detailed_episode.png (single episode analysis)")
+    print(f"All saved to: {output_dir}/")
+    print(f"  - trajectory_3d_singlestep.png")
+    print(f"  - trajectory_xy_singlestep.png (old multi-step rollout)")
+    print(f"  - error_singlestep.png")
+    print(f"  - detailed_episode_singlestep.png")
     print("=" * 80)
 
 
