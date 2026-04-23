@@ -1,0 +1,5 @@
+# Ramp hotspots detected in terrain
+# center_x center_y peak_height area_m2
+19.649 13.088 inf 1.12
+19.448 14.358 inf 0.75
+20.024 12.115 0.331 0.56
