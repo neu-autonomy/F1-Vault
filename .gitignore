@@ -27,3 +27,5 @@ wandb/
 figures/
 notebooks/
 models/
+
+.DS_Store
