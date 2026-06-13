@@ -1,3 +1,13 @@
+"""
+LSTM variant of the dynamics model (March experiment).
+
+STALE -- predates two fixes that train_cnn.py has: it hard-codes the wrong
+elevation layout (676/26x26; the data actually stores 625/25x25 as the last
+625 dims, see CLAUDE.md) and does not apply the boundary filter. Port both
+fixes from train_cnn.py before training with this again. Note the data's
+episodes are mostly 1-2 steps, so sequence_length=5 sequences barely exist.
+"""
+
 import h5py
 import numpy as np
 import torch
