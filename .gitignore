@@ -29,3 +29,6 @@ models/
 
 .DS_Store
 *.zip
+
+*.h5
+data/*.h5

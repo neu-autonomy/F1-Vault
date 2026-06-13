@@ -6,9 +6,10 @@ and visualize_trajectories.py all import from here. (Previously each script
 carried its own copy of these classes, which had to be kept in sync by hand.)
 
 Checkpoint compatibility: the grid size is read from the checkpoint's
-config_dict, so both old checkpoints (elevation_map_size=676, 26x26 -- trained
-before we noticed the H5 file stores a 625-value 25x25 map) and new ones
-(625, 25x25) load through `load_model`.
+config_dict, so checkpoints of either size load through `load_model`. NOTE
+(corrected 2026-06-13): the elevation map is 676 (26x26) -- this is CORRECT.
+Any checkpoint trained with elevation_map_size=625 (25x25) used a misaligned,
+row-sheared map (the old H5 attr was wrong) and should be retrained on 676.
 """
 
 import numpy as np

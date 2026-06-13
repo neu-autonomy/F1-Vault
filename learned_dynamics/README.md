@@ -1,4 +1,4 @@
-# learned_dynamics — pure-learning dynamics models (Emir)
+# learned_dynamics — pure-learning dynamics models
 
 End-to-end learned one-step dynamics models for the robot, separate from the
 physics-informed `f1_vault/` pipeline (Matt's — don't modify from here).

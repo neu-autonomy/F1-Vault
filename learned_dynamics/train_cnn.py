@@ -10,11 +10,14 @@ Hard-won lessons baked into this script (see CLAUDE.md for the full story):
   - Target-only normalization: inputs are fed RAW, only the prediction
     targets (deltas) are normalized. The original variance-weighting
     collapsed to uniform weights and let high-variance dims dominate.
-  - Elevation map layout comes from the H5 attrs (currently 625 values =
-    25x25, the LAST 625 dims of the state). Earlier versions hard-coded
-    676 (26x26), which pulled 51 non-elevation state dims into the
-    "elevation map" and scrambled its spatial structure. Checkpoints in
-    models/cnn_dynamics* predate this fix.
+  - Elevation map is the LAST 676 dims = 26x26 (GridPatternCfg size=2.5,
+    res=0.1 -> 26 samples/axis). Verified against the data 2026-06-13:
+    the joint region ends at col 44 (720-44=676) and the 26x26 reshape is
+    spatially smooth where 25x25 is sheared. NOTE: the H5 `elevation_map_size`
+    attr was hardcoded to a WRONG 625 in files collected before 2026-06-13 --
+    so do not blindly trust the attr on old files; the real map is 676.
+    Checkpoints in models/cnn_dynamics* trained on the 625 slice used a
+    misaligned map and should be retrained.
   - Naive baselines (mean |true delta|, i.e. predict-zero) are printed at
     eval so a silently-broken model shows up immediately.
 """
@@ -40,10 +43,11 @@ from dynamics_model import DynamicsCNN, grid_from_size
 # ============================================================================
 
 class Config:
-    data_file = "data/raw/dynamics_data_0000.h5"
+    data_file = "data/raw"   # file OR directory of batch .h5 files (all are concatenated)
     # Elevation layout is read from the H5 attrs in main(); these are fallbacks.
-    elevation_map_size = 625
-    elevation_grid_size = 25
+    # Real value is 676 (26x26). Old files carry a wrong 625 attr -- see header.
+    elevation_map_size = 676
+    elevation_grid_size = 26
     random_seed = 42
 
     core_state_dim = 22
@@ -55,7 +59,8 @@ class Config:
     batch_size = 512
     learning_rate = 1e-3
     weight_decay = 1e-5
-    num_epochs = 50
+    num_epochs = 100        # base model: 100 epochs (val still descending at 50, not overfitting);
+                            # ReduceLROnPlateau already halves LR on plateau
     val_split = 0.2
     predict_delta = True
 
@@ -246,17 +251,31 @@ def main(args):
     print("=" * 80)
     config.save_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Load data ----
-    print("\nLoading data...")
-    with h5py.File(config.data_file, "r") as f:
-        states = f["states"][:]
-        actions = f["actions"][:]
-        next_states = f["next_states"][:]
-        terminated = f["terminated"][:]
-        truncated = f["truncated"][:]
-        action_dim = f.attrs["action_dim"]
-        config.elevation_map_size = int(f.attrs.get("elevation_map_size",
-                                                    config.elevation_map_size))
+    # ---- Load data (a single .h5 file OR a directory of batch files) ----
+    data_path = Path(config.data_file)
+    files = sorted(data_path.glob("*.h5")) if data_path.is_dir() else [data_path]
+    if not files:
+        raise FileNotFoundError(f"no .h5 files at {data_path}")
+    print(f"\nLoading {len(files)} data file(s) from {data_path} ...")
+    S, A, NS, TM, TR = [], [], [], [], []
+    action_dim, elev_attr = None, config.elevation_map_size
+    for fp in files:
+        with h5py.File(fp, "r") as f:
+            S.append(f["states"][:]); A.append(f["actions"][:]); NS.append(f["next_states"][:])
+            TM.append(f["terminated"][:]); TR.append(f["truncated"][:])
+            action_dim = int(f.attrs["action_dim"])
+            elev_attr = int(f.attrs.get("elevation_map_size", elev_attr))
+            print(f"    {fp.name}: {len(S[-1]):,} rows")
+    states = np.concatenate(S); actions = np.concatenate(A); next_states = np.concatenate(NS)
+    terminated = np.concatenate(TM); truncated = np.concatenate(TR)
+    del S, A, NS, TM, TR
+    config.elevation_map_size = elev_attr
+    # The attr was hardcoded to a WRONG 625 in files collected before 2026-06-13.
+    # The real map is 676 (26x26). Correct it so old files don't train on a sheared map.
+    if config.elevation_map_size == 625:
+        print("  WARNING: elevation_map_size attr is 625 (known-wrong) -- overriding to 676. "
+              "Re-collect with current WheeledLab for a correct attr.")
+        config.elevation_map_size = 676
     config.elevation_grid_size = grid_from_size(config.elevation_map_size)
 
     print(f"  raw rows: {len(states):,}")
