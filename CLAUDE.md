@@ -9,6 +9,7 @@ people** — keep them separate:
 |---|---|---|---|
 | Physics-informed (ODE solver, "dphysics" from MonoForce) | Matt | `f1_vault/` package, `train_best.py`, `tests/`, `configs/`, `checkpoints/`, `best_model_exp0.pt`, `setup.py`, root `README.md` | **Do not modify unless explicitly asked** |
 | Pure learned dynamics (CNN/RNN) | Emir (branch `emir`) | `learned_dynamics/`, `data/visual/` | Active; see findings below |
+| MPPI controller (plans through the learned model) | Emir (branch `emir_controller`) | `controller/` | New; see `controller/README.md` |
 
 Environment: use `.venv/bin/python` (torch + CUDA available). Run all
 scripts from the repo root. `models/`, `figures/` dirs and `*.zip` are
