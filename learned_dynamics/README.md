@@ -34,7 +34,10 @@ Files:
 | `dynamics_model.py` | Shared architecture, checkpoint loading, rollout helpers — single source of truth |
 | `dynamics_api.py` | **Controller-facing inference API** (`JumpDynamics`): single-step + terrain-aware batched rollout. See `CONTROLLER_HANDOFF.md` |
 | `jump_regime_eval.py` | Per-regime accuracy (flat/ramp/airborne) + velocity/steering checks + real-jump tracking |
-| `train_cnn.py` | One-step CNN training (boundary filter + target-only normalization). `data_file` can be a dir — trains on all batches |
+| `train_cnn.py` | CNN training. `--horizon N` = multi-step rollout training (roadmap #1); `horizon=1` (default) = original one-step. Boundary filter + target-only normalization. `data_file` can be a dir |
+| `train_ensemble.py` | Train a K-member deep ensemble via `train_cnn.py` (roadmap #3); passes `--horizon` through. Spreads members over GPUs |
+| `rollout_eval.py` | **Closed-loop N-step** rollout error (the metric #1 targets) comparing checkpoints/ensembles on real jumps; ensemble uncertainty/error calibration |
+| `ENHANCEMENTS.md` | Design + usage + incremental roadmap for enhancements #1–#3 |
 | `train_rnn.py` | LSTM variant — **stale**, see its docstring before using |
 | `inspect_data.py` | H5 health report: episode structure, action stats, integrity |
 | `sanity_check.py` | Checkpoint vs data numerical checks |
@@ -42,27 +45,29 @@ Files:
 | `visualize_trajectories.py` | Per-transition accuracy figures + closed-loop rollouts |
 | `figures/` | Output figures (gitignored) |
 
-## Improvement roadmap (future reference — not yet implemented)
+## Improvement roadmap
 
-The current base (`cnn_dynamics_v3`, 1.2M params, 695K samples, 100 epochs) is solid for
+The base (`cnn_dynamics_v3`, 1.2M params, 695K samples, 100 epochs) is solid for
 single-step prediction and short-horizon control. Ordered by expected payoff:
 
-**1. Multi-step / rollout training loss (highest impact for control).**
-The model is trained on *single-step* error, but the controller uses *multi-step* rollouts,
-so prediction errors compound (exposure bias). Train on N-step rollouts (predict, feed own
-output back, backprop through the unrolled sequence) — or add scheduled sampling. This is the
-single biggest lever for closed-loop fidelity over long horizons.
+**1–3 are IMPLEMENTED on branch `emir_model_controller_enhancements` — see
+[`ENHANCEMENTS.md`](ENHANCEMENTS.md) for design, usage, and the incremental roadmap.**
 
-**2. Throttle/action diversity in data collection.**
-Current data is forward-throttle-biased (mean 0.72, min ~0.06), so low/zero/reverse-throttle
-prediction is out-of-distribution extrapolation. If the controller needs accurate braking or
-speed modulation, recollect with throttle sampled across its full range (and accept it will
-jump less). Re-run `inspect_dynamics_data.py` to confirm the new distribution.
+**1. Multi-step / rollout training loss (highest impact for control). ✅ DONE.**
+`train_cnn.py --horizon N` unrolls N steps (predict → feed own core state back, recorded
+terrain each step, backprop through the window) with scheduled sampling. `horizon=1` is the
+unchanged single-step default. Measure the win with `rollout_eval.py`.
 
-**3. Probabilistic / ensemble dynamics (for risk-aware MPPI).**
-Train a small ensemble (or a model that outputs variance) so the controller knows prediction
-*uncertainty* — lets MPPI avoid regions the model is unsure about (PETS-style). Big robustness
-win for sampling-based control.
+**2. Throttle/action diversity in data collection. ✅ DONE.**
+`collect_dynamics_data.py --throttle_dist {mixture(default),full,highbias}` covers the full
+`[0,1]` throttle range (v3 was forward-biased, mean 0.72). A `mixture` dataset is in
+`data/raw_mixture/`. Confirm with `inspect_data.py`.
+
+**3. Probabilistic / ensemble dynamics (for risk-aware MPPI). ✅ DONE (deep ensemble).**
+`train_ensemble.py` + `dynamics_api.EnsembleJumpDynamics` (mean + disagreement variance) +
+`make_risk_aware_planner_fns` (MPPI-compatible, no change to `mppi.py`). Started with a
+deep ensemble on purpose (simplest robust win); variance heads / full PETS are the next
+increment — see `ENHANCEMENTS.md`.
 
 **4. Trim the model and the inputs.**
 - Drop the unused terrain-decoder head (the model predicts Δelevation but control feeds terrain

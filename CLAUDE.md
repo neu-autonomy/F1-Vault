@@ -96,9 +96,62 @@ local elevation patch from the known terrain each step — do NOT use `synthetic
 which hallucinates terrain and misses jumps (e.g. flies an OOD reverse action 3.8 m up).
 
 Old broken-data model dirs (v2, cnn_dynamics, _fixed, _new, baseline) and stale figures were
-removed; only the v3 base + current figures remain. Remaining/optional: add throttle
-diversity if the controller needs accurate braking/low-speed (current data is
-forward-throttle-biased, so low/reverse-throttle prediction is extrapolation).
+removed; only the v3 base + current figures remain.
+
+## Enhancements branch `emir_model_controller_enhancements` (2026-07-12)
+
+Buffing the model + controller past v3. Full design/usage in
+`learned_dynamics/ENHANCEMENTS.md`; roadmap items #1–#3 of `learned_dynamics/README.md` are
+now implemented. **All are backward compatible — `cnn_dynamics_v3` and every existing tool
+still work unchanged (single-step is `train_cnn.py --horizon 1`, the default).**
+
+- **#1 Multi-step rollout training** — `train_cnn.py --horizon N` unrolls N steps, feeds the
+  model's own core prediction back with the RECORDED terrain patch each step (never
+  hallucinated), backprops through the window, with scheduled sampling (teacher-forcing prob
+  1→0). Attacks exposure bias (the controller rolls out multi-step; v3 only ever saw
+  single-step). Episodes reconstructed + split by episode; checkpoint schema unchanged →
+  drop-in for `JumpDynamics`. Measure with `learned_dynamics/rollout_eval.py` (closed-loop
+  N-step error; single-step evals miss compounding).
+- **#2 Throttle diversity** — `collect_dynamics_data.py --throttle_dist {mixture(default),
+  full,highbias}`. v3 data was forward-biased (mean 0.72); `mixture` covers full `[0,1]`
+  (reverse is disabled, `no_reverse=True`) while keeping jumps. `data/raw_mixture/` (~354k
+  rows, throttle mean 0.58) is the recollected set. (Also fixed a `None/float` crash in the
+  collector's startup print.)
+- **#3 Ensemble dynamics** — `train_ensemble.py` + `dynamics_api.EnsembleJumpDynamics`
+  (mean + member-disagreement variance) + `make_risk_aware_planner_fns` (MPPI-compatible;
+  `mppi.py` untouched). **DELIBERATE DECISION (do not "simplify" back):** started with a
+  **deep ensemble**, NOT a Gaussian variance head — a single net's variance is overconfident
+  off-distribution (where the controller most needs honest uncertainty) and the ensemble
+  reuses the proven trainer unchanged. Variance heads → full PETS is the *next* increment,
+  not a regression. See ENHANCEMENTS.md §#3 for the ordered path.
+
+Recommended artifact = an ensemble whose members are each multi-step-trained (#1 ∘ #3):
+`train_ensemble.py --name ens_ms5 --members 5 --horizon 5 --epochs 100 --gpus 0,1`.
+Trained on `data/raw` first (clean apples-to-apples vs v3, isolates the loss change from the
+data change); retrain on `data/raw_mixture` as a follow-up to fold in #2.
+
+**RESULT (`models/ens_ms5`, 2026-07-12):** on 10-step closed-loop rollout (150 held-out
+jumps, oracle terrain) the ensemble cuts error vs v3 by **2.6× (Z, horizon-mean 3.39→1.31
+cm) and 5× (XY drift at t=10, 31.2→6.2 cm)** — v3's single-step error compounds badly, the
+multi-step ensemble doesn't. Ensemble disagreement pos-std correlates **+0.30** with actual
+error (usable risk signal). Eval: `learned_dynamics/rollout_eval.py`.
+
+## Controller jump fix (branch `emir_model_controller_enhancements`, 2026-07-12)
+
+Emir reported the car not jumping in Isaac (tips over the ramp / drives on). Root cause was
+the **controller cost, not the ramp**: `controller/cost.py` `GoalCost` penalized nose-up
+PITCH like sideways ROLL past ~20°, but climbing a 30-42° ramp IS that much pitch, so MPPI
+read every launch as a near-rollover and stalled at the ramp foot (travelled 0.06-0.45 m).
+Fix = decouple them (roll strict, pitch tolerated to ~51°, `air_max` 0.30→0.40); the car now
+commits, climbs (tilt 36-45°) and traverses ~3 m with small jumps. Two caveats recorded so
+they're not re-litigated: (1) **physics ceiling** — at the 3 m/s hardware cap the ramp only
+yields ~10-15 cm air; "more speed" is NOT available (fast spawns were the original
+unreproducible-jump bug) and LOWERING the ramp angle backfires (14-24° → 0 air, car rolls
+over) so the proven 30-42° geometry is kept. (2) The Isaac terrain "ramp reads under / big
+round-trip error" diagnostic is mostly a spawn-edge + ray-miss artifact, NOT a real
+orientation bug (verified against recorded data); a minor splat-hole fix in
+`controller/isaac_sim/global_terrain.py` cut off-axis round-trip 20→2 cm but was not the
+blocker. Full log: `controller/isaac_sim/README.md`.
 
 ## learned_dynamics/ layout
 

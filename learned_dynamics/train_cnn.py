@@ -64,6 +64,24 @@ class Config:
     val_split = 0.2
     predict_delta = True
 
+    # ---- Multi-step rollout training (roadmap item #1) --------------------
+    # horizon=1 -> the original single-step trainer (unchanged, fully backward
+    # compatible). horizon>1 -> unroll the model N steps, feeding its OWN predicted
+    # core state back in while feeding the RECORDED elevation patch at each step
+    # (never hallucinate terrain -- exactly how the controller uses the model), and
+    # backprop through the whole unrolled window. This attacks exposure bias: the
+    # single-step model is never trained on its own (slightly wrong) inputs, so error
+    # compounds in the controller's multi-step rollout. See CLAUDE.md.
+    horizon = 1
+    stride = 1              # window stride when horizon>1 (1 = max overlap / most windows)
+    # Scheduled sampling: probability of feeding the TRUE core (teacher forcing) instead
+    # of the model's own prediction as the next step's input. Decays linearly from
+    # tf_start (epoch 0) to tf_end (final epoch) so training eases from teacher-forced
+    # toward fully self-fed. tf like 1->0 is the standard curriculum.
+    scheduled_sampling = True
+    tf_start = 1.0
+    tf_end = 0.0
+
     use_normalization = True       # for downstream-tool compatibility
     use_loss_weighting = False
     handle_inf_elevation = True
@@ -231,6 +249,207 @@ def eval_epoch(model, loader, device, dataset):
 
 
 # ============================================================================
+# MULTI-STEP ROLLOUT TRAINING  (roadmap item #1)
+# ============================================================================
+
+class SequenceDynamicsDataset(Dataset):
+    """Windows of consecutive same-episode transitions for N-step rollout training.
+
+    Rows in the H5 are one-step transitions interleaved across envs; an episode is one
+    (env_id, episode_id) group sorted by timestep, valid up to the first boundary row
+    (terminated|truncated -> next_state is a post-reset teleport, see CLAUDE.md). This
+    dataset reconstructs episodes, then slides length-N windows over each episode's
+    contiguous non-boundary run.
+
+    Each item is a window starting at reordered position `start`:
+        core0       (22,)          initial core state (fed once)
+        patches     (N+1, 26, 26)  RECORDED elevation patches for steps 0..N (raw, inf-filled)
+        actions     (N, 2)         recorded actions for steps 0..N-1
+        true_cores  (N, 22)        recorded core states at steps 1..N (rollout targets)
+
+    Target/input normalization stats are computed ONCE over all valid single-step
+    transitions (identical convention to the single-step trainer) and passed in, so a
+    multi-step checkpoint's `stats` are drop-in compatible with dynamics_api / eval tools.
+    """
+
+    def __init__(self, states, actions, boundary, keys, timesteps, config, stats):
+        self.config = config
+        self.N = config.horizon
+        core_dim = config.core_state_dim
+        elev_dim = config.elevation_map_size
+        grid = config.elevation_grid_size
+
+        if config.handle_inf_elevation:
+            states = self._replace_inf(states.copy())
+
+        # Reorder rows into episode-contiguous order: sort by (key, timestep).
+        order = np.lexsort((timesteps, keys))
+        states = states[order]
+        actions = actions[order]
+        boundary = boundary[order]
+        keys = keys[order]
+
+        self.core_states = np.ascontiguousarray(states[:, :core_dim], dtype=np.float32)
+        self.elevation_maps = np.ascontiguousarray(
+            states[:, -elev_dim:].reshape(-1, grid, grid), dtype=np.float32)
+        self.actions = np.ascontiguousarray(actions, dtype=np.float32)
+
+        # Build valid windows. A window [start .. start+N] needs N transitions at
+        # positions start..start+N-1 that are all non-boundary and stay within one
+        # episode (contiguous key). Slide with `stride`.
+        n = len(keys)
+        same_ep = np.zeros(n, dtype=bool)
+        same_ep[:-1] = keys[:-1] == keys[1:]
+        # position p is a valid transition if same episode as p+1 and p is not a boundary
+        valid_trans = same_ep & ~boundary
+        starts = []
+        N, stride = self.N, config.stride
+        p = 0
+        while p <= n - N:
+            # need positions p..p+N-1 all valid transitions AND contiguous (same_ep chain)
+            if valid_trans[p:p + N].all():
+                starts.append(p)
+                p += stride
+            else:
+                # jump past the first invalid transition in this span
+                bad = p + int(np.argmin(valid_trans[p:p + N]))
+                p = bad + 1
+        self.starts = np.asarray(starts, dtype=np.int64)
+
+        # Stats (shared, computed once from train transitions -- see main()).
+        self.core_state_mean = stats["core_state_mean"]
+        self.core_state_std = stats["core_state_std"]
+        self.elevation_mean = stats["elevation_mean"]
+        self.elevation_std = stats["elevation_std"]
+        self.action_mean = stats["action_mean"]
+        self.action_std = stats["action_std"]
+        self.core_target_mean = stats["core_target_mean"]
+        self.core_target_std = stats["core_target_std"]
+        self.elevation_target_mean = stats["elevation_target_mean"]
+        self.elevation_target_std = stats["elevation_target_std"]
+        self.core_weights = np.ones(core_dim)
+        self.elevation_weight = 1.0
+
+        print(f"\nSequence dataset (horizon={N}, stride={stride}): "
+              f"{len(self.starts):,} windows from {n:,} rows")
+
+    def _replace_inf(self, data):
+        elev = data[:, -self.config.elevation_map_size:]
+        inf_mask = np.isinf(elev)
+        if inf_mask.any():
+            elev[inf_mask] = -10.0
+            data[:, -self.config.elevation_map_size:] = elev
+        return data
+
+    def __len__(self):
+        return len(self.starts)
+
+    def __getitem__(self, idx):
+        s = self.starts[idx]
+        N = self.N
+        core0 = self.core_states[s]                       # (22,)
+        patches = self.elevation_maps[s:s + N + 1]        # (N+1, 26, 26)
+        actions = self.actions[s:s + N]                   # (N, 2)
+        true_cores = self.core_states[s + 1:s + N + 1]    # (N, 22)
+        return (
+            torch.from_numpy(core0.copy()),
+            torch.from_numpy(patches.copy()),
+            torch.from_numpy(actions.copy()),
+            torch.from_numpy(true_cores.copy()),
+        )
+
+
+def _rollout_batch(model, core0, patches, actions, dataset, device,
+                   tf_prob, true_cores=None):
+    """Unroll the model N steps on a batch, feeding recorded patches each step.
+
+    Returns (core_loss_norm, elev_loss_norm, pred_cores) where pred_cores is
+    (B, N, 22) physical. Uses target-only normalization (inputs raw, delta targets
+    normalized) -- the only mode this project trains. When tf_prob>0 (scheduled
+    sampling) each step's NEXT input is the recorded core with prob tf_prob, else the
+    model's own prediction (backprop flows only through the self-fed branch).
+    """
+    ct_mean = torch.as_tensor(dataset.core_target_mean, dtype=torch.float32, device=device)
+    ct_std = torch.as_tensor(dataset.core_target_std, dtype=torch.float32, device=device)
+    et_mean = float(dataset.elevation_target_mean)
+    et_std = float(dataset.elevation_target_std)
+
+    B, N = core0.shape[0], actions.shape[1]
+    cur = core0                                            # (B, 22) physical, raw input
+    core_loss = core0.new_zeros(())
+    elev_loss = core0.new_zeros(())
+    preds = []
+    for t in range(N):
+        patch_t = patches[:, t].unsqueeze(1)               # (B,1,26,26) raw
+        pred_core_norm, pred_elev_norm = model(cur, patch_t, actions[:, t])
+        pred_delta = pred_core_norm * ct_std + ct_mean     # denorm -> physical delta
+        next_core = cur + pred_delta                       # (B,22) physical
+        preds.append(next_core.unsqueeze(1))
+
+        if true_cores is not None:
+            true_t = true_cores[:, t]
+            core_loss = core_loss + (((next_core - true_t) / ct_std) ** 2).mean()
+            true_elev_delta = patches[:, t + 1] - patches[:, t]
+            target_elev_norm = (true_elev_delta - et_mean) / et_std
+            elev_loss = elev_loss + ((pred_elev_norm.squeeze(1) - target_elev_norm) ** 2).mean()
+
+        if t < N - 1:
+            if true_cores is not None and tf_prob > 0:
+                tf_mask = (torch.rand(B, 1, device=device) < tf_prob)
+                cur = torch.where(tf_mask, true_cores[:, t], next_core)
+            else:
+                cur = next_core
+    return core_loss / N, elev_loss / N, torch.cat(preds, dim=1)
+
+
+def tf_prob_for_epoch(config, epoch):
+    """Linear scheduled-sampling curriculum: tf_start -> tf_end over training."""
+    if not config.scheduled_sampling:
+        return 0.0
+    if config.num_epochs <= 1:
+        return config.tf_end
+    frac = epoch / (config.num_epochs - 1)
+    return config.tf_start + (config.tf_end - config.tf_start) * frac
+
+
+def train_epoch_seq(model, loader, optimizer, device, dataset, tf_prob):
+    model.train()
+    total_loss = 0.0
+    for core0, patches, actions, true_cores in loader:
+        core0 = core0.to(device); patches = patches.to(device)
+        actions = actions.to(device); true_cores = true_cores.to(device)
+        optimizer.zero_grad()
+        core_loss, elev_loss, _ = _rollout_batch(
+            model, core0, patches, actions, dataset, device, tf_prob, true_cores)
+        loss = core_loss + 0.1 * elev_loss
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * len(core0)
+    return total_loss / len(loader.dataset)
+
+
+@torch.no_grad()
+def eval_epoch_seq(model, loader, device, dataset):
+    """Pure closed-loop (self-fed, tf_prob=0) N-step eval. Returns (loss, per-step
+    physical |error| for X/Y/Z as (steps,3), and the predict-'hold initial' baseline)."""
+    model.eval()
+    total_loss = 0.0
+    N = dataset.N
+    step_abs_err = np.zeros((N, 3)); step_naive = np.zeros((N, 3)); count = 0
+    for core0, patches, actions, true_cores in loader:
+        core0 = core0.to(device); patches = patches.to(device)
+        actions = actions.to(device); true_cores = true_cores.to(device)
+        core_loss, elev_loss, preds = _rollout_batch(
+            model, core0, patches, actions, dataset, device, 0.0, true_cores)
+        total_loss += (core_loss + 0.1 * elev_loss).item() * len(core0)
+        b = len(core0)
+        err = (preds[:, :, :3] - true_cores[:, :, :3]).abs().cpu().numpy()   # (b,N,3)
+        naive = (core0[:, None, :3] - true_cores[:, :, :3]).abs().cpu().numpy()
+        step_abs_err += err.sum(axis=0); step_naive += naive.sum(axis=0); count += b
+    return total_loss / len(loader.dataset), step_abs_err / count, step_naive / count
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -240,6 +459,11 @@ def main(args):
     if args.epochs:     config.num_epochs = args.epochs
     if args.batch_size: config.batch_size = args.batch_size
     if args.save_dir:   config.save_dir = Path(args.save_dir)
+    if args.horizon is not None: config.horizon = args.horizon
+    if args.stride is not None:  config.stride = args.stride
+    if args.seed is not None:    config.random_seed = args.seed
+    if args.no_scheduled_sampling: config.scheduled_sampling = False
+    if args.tf_end is not None:  config.tf_end = args.tf_end
 
     torch.manual_seed(config.random_seed)
     np.random.seed(config.random_seed)
@@ -258,17 +482,20 @@ def main(args):
         raise FileNotFoundError(f"no .h5 files at {data_path}")
     print(f"\nLoading {len(files)} data file(s) from {data_path} ...")
     S, A, NS, TM, TR = [], [], [], [], []
+    EV, EP, TS = [], [], []   # env_ids, episode_ids, timesteps (needed for horizon>1)
     action_dim, elev_attr = None, config.elevation_map_size
     for fp in files:
         with h5py.File(fp, "r") as f:
             S.append(f["states"][:]); A.append(f["actions"][:]); NS.append(f["next_states"][:])
             TM.append(f["terminated"][:]); TR.append(f["truncated"][:])
+            EV.append(f["env_ids"][:]); EP.append(f["episode_ids"][:]); TS.append(f["timesteps"][:])
             action_dim = int(f.attrs["action_dim"])
             elev_attr = int(f.attrs.get("elevation_map_size", elev_attr))
             print(f"    {fp.name}: {len(S[-1]):,} rows")
     states = np.concatenate(S); actions = np.concatenate(A); next_states = np.concatenate(NS)
     terminated = np.concatenate(TM); truncated = np.concatenate(TR)
-    del S, A, NS, TM, TR
+    env_ids = np.concatenate(EV); episode_ids = np.concatenate(EP); timesteps = np.concatenate(TS)
+    del S, A, NS, TM, TR, EV, EP, TS
     config.elevation_map_size = elev_attr
     # The attr was hardcoded to a WRONG 625 in files collected before 2026-06-13.
     # The real map is 676 (26x26). Correct it so old files don't train on a sheared map.
@@ -282,47 +509,83 @@ def main(args):
     print(f"  elevation map: last {config.elevation_map_size} dims "
           f"({config.elevation_grid_size}x{config.elevation_grid_size}, from H5 attrs)")
 
-    # ---- Apply boundary filter (this is the key correction) ----
-    valid = ~(terminated | truncated)
+    boundary = terminated | truncated
+    valid = ~boundary
     n_total = len(states)
-    n_kept = int(valid.sum())
-    print(f"  boundary filter: keeping {n_kept:,} / {n_total:,} "
-          f"({100*n_kept/n_total:.1f}%)")
-    print(f"  (boundary rows have next_state = post-reset spawn, not "
-          f"physics result)")
+    print(f"  boundary rows (terminated|truncated): {int(boundary.sum()):,} / {n_total:,} "
+          f"({100*boundary.mean():.1f}%)")
 
-    states = states[valid]
-    actions = actions[valid]
-    next_states = next_states[valid]
+    is_seq = config.horizon > 1
 
-    pos_delta = next_states[:, :3] - states[:, :3]
-    print(f"  Δpos magnitudes (filtered): "
-          f"|X| mean={np.abs(pos_delta[:,0]).mean():.3f}m  max={np.abs(pos_delta[:,0]).max():.3f}m")
-    print(f"                              "
-          f"|Y| mean={np.abs(pos_delta[:,1]).mean():.3f}m  max={np.abs(pos_delta[:,1]).max():.3f}m")
-    print(f"                              "
-          f"|Z| mean={np.abs(pos_delta[:,2]).mean():.3f}m  max={np.abs(pos_delta[:,2]).max():.3f}m")
+    if not is_seq:
+        # ================= SINGLE-STEP PATH (original, unchanged) =================
+        states = states[valid]; actions = actions[valid]; next_states = next_states[valid]
+        pos_delta = next_states[:, :3] - states[:, :3]
+        print(f"  boundary filter -> {len(states):,} rows kept")
+        print(f"  Δpos (filtered): "
+              f"|X| mean={np.abs(pos_delta[:,0]).mean():.3f} max={np.abs(pos_delta[:,0]).max():.3f} | "
+              f"|Y| mean={np.abs(pos_delta[:,1]).mean():.3f} max={np.abs(pos_delta[:,1]).max():.3f} | "
+              f"|Z| mean={np.abs(pos_delta[:,2]).mean():.3f} max={np.abs(pos_delta[:,2]).max():.3f}")
 
-    # ---- Train/val split ----
-    n = len(states)
-    n_train = int(n * (1 - config.val_split))
-    idx = np.random.permutation(n)
-    train_idx, val_idx = idx[:n_train], idx[n_train:]
-    print(f"\nSplit: {len(train_idx):,} train, {len(val_idx):,} val")
+        n = len(states)
+        n_train = int(n * (1 - config.val_split))
+        idx = np.random.permutation(n)
+        train_idx, val_idx = idx[:n_train], idx[n_train:]
+        print(f"\nSplit: {len(train_idx):,} train, {len(val_idx):,} val (by row)")
 
-    # ---- Datasets ----
-    train_dataset = CNNDynamicsDataset(
-        states[train_idx], actions[train_idx], next_states[train_idx], config,
-    )
-    val_dataset = CNNDynamicsDataset(
-        states[val_idx], actions[val_idx], next_states[val_idx], config,
-        target_stats={
-            "core_target_mean": train_dataset.core_target_mean,
-            "core_target_std":  train_dataset.core_target_std,
-            "elevation_target_mean": train_dataset.elevation_target_mean,
-            "elevation_target_std":  train_dataset.elevation_target_std,
-        },
-    )
+        train_dataset = CNNDynamicsDataset(
+            states[train_idx], actions[train_idx], next_states[train_idx], config,
+        )
+        val_dataset = CNNDynamicsDataset(
+            states[val_idx], actions[val_idx], next_states[val_idx], config,
+            target_stats={
+                "core_target_mean": train_dataset.core_target_mean,
+                "core_target_std":  train_dataset.core_target_std,
+                "elevation_target_mean": train_dataset.elevation_target_mean,
+                "elevation_target_std":  train_dataset.elevation_target_std,
+            },
+        )
+    else:
+        # ================= MULTI-STEP (SEQUENCE) PATH (roadmap #1) =================
+        # Split by EPISODE (not row) so no window leaks across the train/val boundary.
+        keys = env_ids.astype(np.int64) * 1_000_000 + episode_ids.astype(np.int64)
+        uniq = np.unique(keys)
+        perm = np.random.permutation(len(uniq))
+        n_val_ep = int(len(uniq) * config.val_split)
+        val_keys = set(uniq[perm[:n_val_ep]].tolist())
+        val_row = np.fromiter((k in val_keys for k in keys), dtype=bool, count=len(keys))
+        train_row = ~val_row
+        print(f"\nSplit by episode: {len(uniq)-n_val_ep:,} train / {n_val_ep:,} val episodes "
+              f"({int(train_row.sum()):,}/{int(val_row.sum()):,} rows)")
+
+        # Stats computed ONCE over TRAIN valid transitions (same convention as single-step,
+        # so the checkpoint's stats stay drop-in compatible with dynamics_api / eval tools).
+        tr = train_row & valid
+        elev = config.elevation_map_size
+        c = states[tr][:, :config.core_state_dim].astype(np.float32)
+        nc = next_states[tr][:, :config.core_state_dim].astype(np.float32)
+        ct = nc - c
+        e_in = states[tr][:, -elev:].astype(np.float32)
+        e_in[np.isinf(e_in)] = -10.0
+        e_nx = next_states[tr][:, -elev:].astype(np.float32)
+        e_nx[np.isinf(e_nx)] = -10.0
+        et = e_nx - e_in
+        stats = {
+            "core_state_mean": c.mean(axis=0), "core_state_std": c.std(axis=0) + 1e-8,
+            "elevation_mean": e_in.mean(), "elevation_std": e_in.std() + 1e-8,
+            "action_mean": actions[tr].mean(axis=0), "action_std": actions[tr].std(axis=0) + 1e-8,
+            "core_target_mean": ct.mean(axis=0), "core_target_std": ct.std(axis=0) + 1e-6,
+            "elevation_target_mean": et.mean(), "elevation_target_std": et.std() + 1e-6,
+        }
+        del c, nc, ct, e_in, e_nx, et
+        print(f"  Δcore std[:3] (target scale): {stats['core_target_std'][:3]}")
+
+        train_dataset = SequenceDynamicsDataset(
+            states[train_row], actions[train_row], boundary[train_row],
+            keys[train_row], timesteps[train_row], config, stats)
+        val_dataset = SequenceDynamicsDataset(
+            states[val_row], actions[val_row], boundary[val_row],
+            keys[val_row], timesteps[val_row], config, stats)
 
     train_loader = DataLoader(
         train_dataset, batch_size=config.batch_size, shuffle=True,
@@ -359,27 +622,42 @@ def main(args):
     best_val_loss = float("inf")
 
     for epoch in range(config.num_epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, config.device)
-        val_loss, val_core_err, val_elev_err, val_true_delta = eval_epoch(
-            model, val_loader, config.device, train_dataset,
-        )
+        if is_seq:
+            tf_prob = tf_prob_for_epoch(config, epoch)
+            train_loss = train_epoch_seq(
+                model, train_loader, optimizer, config.device, train_dataset, tf_prob)
+            val_loss, step_err, step_naive = eval_epoch_seq(
+                model, val_loader, config.device, train_dataset)
+        else:
+            train_loss = train_epoch(model, train_loader, optimizer, config.device)
+            val_loss, val_core_err, val_elev_err, val_true_delta = eval_epoch(
+                model, val_loader, config.device, train_dataset,
+            )
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         scheduler.step(val_loss)
 
-        # Per-axis stats
-        mae_per_axis = np.abs(val_core_err[:, :3]).mean(axis=0)
-        naive_per_axis = np.abs(val_true_delta[:, :3]).mean(axis=0)
-
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:3d}/{config.num_epochs} | "
-                  f"Train: {train_loss:.5f} | Val: {val_loss:.5f}")
-            print(f"          Pos MAE  (m):    "
-                  f"X={mae_per_axis[0]:.4f}  Y={mae_per_axis[1]:.4f}  Z={mae_per_axis[2]:.4f}")
-            print(f"          Naive MAE(m):    "
-                  f"X={naive_per_axis[0]:.4f}  Y={naive_per_axis[1]:.4f}  Z={naive_per_axis[2]:.4f}  "
-                  f"(predict-zero baseline)")
+            if is_seq:
+                N = config.horizon
+                print(f"Epoch {epoch+1:3d}/{config.num_epochs} | "
+                      f"Train: {train_loss:.5f} | Val: {val_loss:.5f} | tf={tf_prob:.2f}")
+                print(f"          {N}-step closed-loop Z MAE (cm): "
+                      f"step1={step_err[0,2]*100:.2f}  step{N}={step_err[-1,2]*100:.2f}  "
+                      f"(naive-hold step{N}={step_naive[-1,2]*100:.2f})")
+                print(f"          final-step XY MAE (cm): "
+                      f"X={step_err[-1,0]*100:.2f}  Y={step_err[-1,1]*100:.2f}")
+            else:
+                mae_per_axis = np.abs(val_core_err[:, :3]).mean(axis=0)
+                naive_per_axis = np.abs(val_true_delta[:, :3]).mean(axis=0)
+                print(f"Epoch {epoch+1:3d}/{config.num_epochs} | "
+                      f"Train: {train_loss:.5f} | Val: {val_loss:.5f}")
+                print(f"          Pos MAE  (m):    "
+                      f"X={mae_per_axis[0]:.4f}  Y={mae_per_axis[1]:.4f}  Z={mae_per_axis[2]:.4f}")
+                print(f"          Naive MAE(m):    "
+                      f"X={naive_per_axis[0]:.4f}  Y={naive_per_axis[1]:.4f}  Z={naive_per_axis[2]:.4f}  "
+                      f"(predict-zero baseline)")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -400,6 +678,10 @@ def main(args):
                     "use_loss_weighting": False,
                     "target_only_normalization": True,
                     "trained_with_boundary_filter": True,
+                    # roadmap #1: >1 means this checkpoint was trained on N-step rollouts
+                    # (recorded terrain fed back + scheduled sampling). 1 = single-step.
+                    "train_horizon": config.horizon,
+                    "scheduled_sampling": bool(is_seq and config.scheduled_sampling),
                 },
                 "stats": {
                     "core_state_mean": train_dataset.core_state_mean,
@@ -437,28 +719,39 @@ def main(args):
 
     # ---- Final eval ----
     print("\n" + "=" * 80)
-    print("FINAL EVALUATION (best checkpoint, val set, boundary-filtered)")
+    print(f"FINAL EVALUATION (best checkpoint, val set) | horizon={config.horizon}")
     print("=" * 80)
 
     ckpt = torch.load(config.save_dir / "best_model.pt", weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
-    _, final_core_err, _, final_true_delta = eval_epoch(
-        model, val_loader, config.device, train_dataset,
-    )
 
-    print(f"\n  axis      model MAE      naive MAE       improvement")
-    print(f"  " + "-" * 56)
-    for i, lbl in enumerate(["X", "Y", "Z"]):
-        m = np.abs(final_core_err[:, i]).mean()
-        n_ = np.abs(final_true_delta[:, i]).mean()
-        improvement = "BETTER" if m < n_ else "WORSE"
-        ratio = m / n_ if n_ > 1e-9 else float("inf")
-        print(f"  {lbl:>4}    {m*100:7.2f}cm     {n_*100:7.2f}cm     "
-              f"{improvement} ({ratio:.2f}x naive)")
-
-    print(f"\nIf model MAE >= naive MAE on any axis, the model is no better")
-    print(f"than predicting 'no motion' on that axis. Either the model is")
-    print(f"undertrained or that axis isn't predictable from the inputs.")
+    if is_seq:
+        _, step_err, step_naive = eval_epoch_seq(model, val_loader, config.device, train_dataset)
+        N = config.horizon
+        print(f"\n  {N}-step closed-loop (self-fed, recorded terrain), per-step |error| vs "
+              f"'hold initial' baseline")
+        print(f"  step     X MAE      Y MAE      Z MAE     | Z naive")
+        print(f"  " + "-" * 56)
+        for t in range(N):
+            print(f"  {t+1:>3}   {step_err[t,0]*100:7.2f}cm {step_err[t,1]*100:7.2f}cm "
+                  f"{step_err[t,2]*100:7.2f}cm | {step_naive[t,2]*100:7.2f}cm")
+        print(f"\n  (single-step Z ~ step1; the point of #1 is that step{N} stays low too — "
+              f"that's reduced exposure bias vs a single-step model.)")
+    else:
+        _, final_core_err, _, final_true_delta = eval_epoch(
+            model, val_loader, config.device, train_dataset,
+        )
+        print(f"\n  axis      model MAE      naive MAE       improvement")
+        print(f"  " + "-" * 56)
+        for i, lbl in enumerate(["X", "Y", "Z"]):
+            m = np.abs(final_core_err[:, i]).mean()
+            n_ = np.abs(final_true_delta[:, i]).mean()
+            improvement = "BETTER" if m < n_ else "WORSE"
+            ratio = m / n_ if n_ > 1e-9 else float("inf")
+            print(f"  {lbl:>4}    {m*100:7.2f}cm     {n_*100:7.2f}cm     "
+                  f"{improvement} ({ratio:.2f}x naive)")
+        print(f"\nIf model MAE >= naive MAE on any axis, the model is no better than "
+              f"predicting 'no motion' on that axis.")
     print(f"\nModel saved: {config.save_dir}/best_model.pt")
 
 
@@ -468,5 +761,17 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, help="Batch size")
     parser.add_argument("--save_dir", type=str, help="Output directory")
+    parser.add_argument("--horizon", type=int, default=None,
+                        help="Rollout-training horizon N (roadmap #1). 1 = single-step "
+                             "(default/original). >1 = unroll N steps, feed predictions back "
+                             "with recorded terrain + scheduled sampling.")
+    parser.add_argument("--stride", type=int, default=None,
+                        help="Window stride for horizon>1 (default 1 = max overlap).")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed (vary this per ensemble member, roadmap #3).")
+    parser.add_argument("--no_scheduled_sampling", action="store_true",
+                        help="Disable scheduled sampling (pure self-fed rollout) for horizon>1.")
+    parser.add_argument("--tf_end", type=float, default=None,
+                        help="Final teacher-forcing prob for scheduled sampling (default 0.0).")
     args = parser.parse_args()
     main(args)

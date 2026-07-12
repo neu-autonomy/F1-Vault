@@ -145,6 +145,123 @@ class JumpDynamics:
         return traj[0] if single else traj
 
 
+class EnsembleJumpDynamics:
+    """K independently-trained JumpDynamics models -> mean prediction + disagreement variance.
+
+    Roadmap item #3 (risk-aware MPPI). Uncertainty here is EPISTEMIC: the spread of the
+    K members' predictions. Where the members agree the model is confident; where they
+    disagree (typically out-of-distribution states/actions -- e.g. the low-throttle regime
+    the v3 data barely covered, or an OOD launch) the variance is large, and a risk-aware
+    controller can steer away from it. This is the simplest robust uncertainty estimate
+    (a deep ensemble); a later increment can make each member ALSO output a variance head
+    (Gaussian NLL) for full PETS-style epistemic+aleatoric uncertainty -- see CLAUDE.md.
+
+    Members must share I/O conventions (same core layout, elevation size, normalization).
+    They can differ in weights only (different seeds) -- the intended use. Multi-step
+    (rollout-trained) members are fine and recommended: they compound less.
+    """
+
+    def __init__(self, ckpt_paths, device=None):
+        if isinstance(ckpt_paths, (str, Path)):
+            ckpt_paths = [ckpt_paths]
+        self.members = [JumpDynamics(p, device=device) for p in ckpt_paths]
+        if not self.members:
+            raise ValueError("EnsembleJumpDynamics needs >= 1 checkpoint")
+        m0 = self.members[0]
+        self.device, self.core_dim = m0.device, m0.core_dim
+        self.elev_size, self.grid = m0.elev_size, m0.grid
+
+    @classmethod
+    def from_dir(cls, ensemble_dir, device=None):
+        """Load every member_*/best_model.pt under an ensemble directory (see train_ensemble.py)."""
+        d = Path(ensemble_dir)
+        paths = sorted(d.glob("member_*/best_model.pt"))
+        if not paths:
+            raise FileNotFoundError(f"no member_*/best_model.pt under {d}")
+        return cls(paths, device=device)
+
+    # ------------------------------------------------------------------
+    def predict_step_dist(self, core, elevation_patch, action):
+        """One step -> (mean_next_core, var_next_core), both shaped like `core`.
+
+        var is the per-dimension variance ACROSS the K members (epistemic uncertainty).
+        """
+        preds = np.stack(
+            [m.predict_step(core, elevation_patch, action) for m in self.members], axis=0)
+        return preds.mean(axis=0), preds.var(axis=0)
+
+    def predict_step(self, core, elevation_patch, action):
+        """Ensemble-mean one step (drop-in for JumpDynamics.predict_step)."""
+        return self.predict_step_dist(core, elevation_patch, action)[0]
+
+    # ------------------------------------------------------------------
+    def rollout(self, core0, actions, get_patch, return_var=False):
+        """Closed-loop rollout propagating the ENSEMBLE MEAN, tracking per-step disagreement.
+
+        Same signature/semantics as JumpDynamics.rollout (recorded/known terrain via
+        get_patch, never hallucinated). With return_var=True also returns a variance
+        trajectory of the same shape: var[..., t, :] is the epistemic variance of the
+        members' ONE-STEP predictions made at step t-1 (row 0 is zeros). Mean propagation
+        keeps all members on one shared trajectory (cheap, deterministic); the per-step
+        spread is the risk signal the cost function reads.
+        """
+        single = (np.asarray(core0).ndim == 1)
+        core = np.atleast_2d(np.asarray(core0, np.float32)).copy()
+        acts = np.asarray(actions, np.float32)
+        if single:
+            acts = acts[None]
+        B, T = core.shape[0], acts.shape[1]
+
+        traj = np.zeros((B, T + 1, self.core_dim), np.float32)
+        var = np.zeros((B, T + 1, self.core_dim), np.float32)
+        traj[:, 0] = core
+        for t in range(T):
+            patch = np.asarray(get_patch(core, t), np.float32)
+            mean, v = self.predict_step_dist(core, patch, acts[:, t])
+            core = np.atleast_2d(mean)
+            traj[:, t + 1] = core
+            var[:, t + 1] = np.atleast_2d(v)
+        if single:
+            traj, var = traj[0], var[0]
+        return (traj, var) if return_var else traj
+
+
+def make_risk_aware_planner_fns(ensemble, get_patch, base_cost_fn,
+                                risk_weight=1.0, pos_dims=(0, 1, 2)):
+    """Bundle an EnsembleJumpDynamics + a base cost into MPPI-compatible (rollout_fn, cost_fn).
+
+    MPPI (controller/mppi.py) only needs:
+        rollout_fn(core0 (K,D), actions (K,T,A)) -> traj (K,T+1,D)
+        cost_fn(traj (K,T+1,D), actions (K,T,A))  -> cost (K,)
+    so this needs NO change to mppi.py. rollout_fn returns the ensemble-mean trajectory
+    (exactly what a deterministic model would) and stashes the per-rollout epistemic
+    uncertainty; cost_fn adds `risk_weight * uncertainty` to your base task cost, so the
+    planner avoids action sequences the ensemble is unsure about (PETS-style).
+
+    uncertainty per rollout = sum over horizon of the positional std (sqrt of summed
+    variance over pos_dims) -- "how far off could the predicted path be". Tune risk_weight
+    against your base cost scale (0 disables; start small and raise until the planner stops
+    picking OOD launches).
+    """
+    stash = {}
+
+    def rollout_fn(core0, actions):
+        traj, var = ensemble.rollout(core0, actions, get_patch, return_var=True)
+        stash["var"] = var                              # (K, T+1, D)
+        return traj
+
+    def cost_fn(traj, actions):
+        base = np.asarray(base_cost_fn(traj, actions), np.float32)
+        var = stash.get("var")
+        if var is None:
+            return base
+        pos_var = var[:, 1:, list(pos_dims)].sum(axis=2)   # (K, T) summed over pos dims
+        uncertainty = np.sqrt(np.clip(pos_var, 0, None)).sum(axis=1)   # (K,)
+        return base + risk_weight * uncertainty
+
+    return rollout_fn, cost_fn
+
+
 class TerrainMap:
     """Convenience: a static known heightmap you can query for elevation patches.
 
