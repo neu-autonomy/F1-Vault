@@ -73,7 +73,11 @@ class GoalCostConfig:
                                    # the crest and flipped. The ramp is 3 m wide and the goal is
                                    # ~straight ahead, so steering there is unnecessary; forbid it
                                    # via a height-gated penalty (height IS well-predicted).
-    w_brake_ramp: float = 12.0     # penalty on NOT committing throttle while on the ramp
+    w_brake_ramp: float = 0.0      # penalty on NOT committing throttle while on the ramp.
+                                   # 0 for the HIGH-SPEED experiment: the car already has ample
+                                   # momentum at 6 m/s, so forcing full throttle over-launched it
+                                   # (tilt >70 -> flip). Let MPPI modulate for a controlled launch.
+                                   # (The 3 m/s base controller needs this ~12 to avoid stalling.)
     air_on_ramp: float = 0.008     # [m] above flat that counts as "on/over the ramp". LOW on
                                    # purpose: on the gentle ramp the root barely rises (~1 cm),
                                    # so a higher gate missed the crest where steering rolls it.
